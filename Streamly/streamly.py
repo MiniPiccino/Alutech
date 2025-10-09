@@ -12,6 +12,8 @@ import uuid
 import logging
 from datetime import datetime
 from typing import List, Tuple
+import re
+
 
 import streamlit as st
 from dotenv import load_dotenv, find_dotenv
@@ -71,6 +73,20 @@ def _ping_qdrant_rest() -> tuple[bool, str]:
     except Exception as e:
         return False, f"REST healthz failed: {e}"
 
+def clean_llm_output(text: str) -> str:
+    """
+    Uklanja sve <think> tagove i druge poznate meta-oznake iz LLM odgovora.
+    Može se proširiti kasnije za druge tagove poput <reflection>, <note>, itd.
+    """
+    if not text:
+        return ""
+    # ukloni <think> ... </think>
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    # ukloni <reflection> ... </reflection> ili druge poznate meta tagove
+    text = re.sub(r"<reflection>.*?</reflection>", "", text, flags=re.DOTALL)
+    # ukloni višestruke prazne linije
+    text = re.sub(r"\n\s*\n", "\n", text)
+    return text.strip()
 
 def _mk_qdrant_client_from_url():
     #raw_url = os.getenv("QDRANT_URL")
@@ -325,7 +341,9 @@ def get_model_response(prompt: str, model_choice: str) -> str:
                         temperature=0.7,
                         stream=False
                     )
-                    return response.choices[0].message.content.strip()
+                    #return response.choices[0].message.content.strip()
+                    raw_text = response.choices[0].message.content
+                    return clean_llm_output(raw_text)
                 except Exception as e:
                     logging.info(f"Chat model {model_id} failed: {e}")
                     continue
@@ -350,7 +368,7 @@ def get_model_response(prompt: str, model_choice: str) -> str:
                     )
                     result = response.strip() if response else ""
                     if result and len(result) > 10:
-                        return result
+                        return clean_llm_output(result)
                 except Exception as e:
                     logging.info(f"Text model {model_id} failed: {e}")
                     continue
@@ -367,7 +385,7 @@ def get_model_response(prompt: str, model_choice: str) -> str:
                 )
                 result = response.strip() if response else ""
                 if result:
-                    return result
+                    return clean_llm_output(result)
             except Exception as e:
                 logging.info(f"Default model failed: {e}")
             
@@ -406,7 +424,9 @@ def get_model_response(prompt: str, model_choice: str) -> str:
                         temperature=0.7,
                         stream=False
                     )
-                    return response.choices[0].message.content.strip()
+                    #return response.choices[0].message.content.strip()
+                    raw_text = response.choices[0].message.content
+                    return clean_llm_output(raw_text)
 
                 except Exception as e:
                     logging.info(f"Provider {provider} failed: {e}")
@@ -459,7 +479,10 @@ def get_model_response(prompt: str, model_choice: str) -> str:
                 max_tokens=1200,
                 temperature=0.7,
             )
-            return completion.choices[0].message.content
+
+            raw_text = completion.choices[0].message.content  # DeepSeek
+            clean_text = clean_llm_output(raw_text)
+            return clean_text
         except Exception as e:
             return f"DeepSeek R1 error: {e}"
 
