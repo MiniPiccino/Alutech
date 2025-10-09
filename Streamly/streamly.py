@@ -4,6 +4,7 @@ Streamlit app: users upload documents (PDF/TXT) → chunks → embeddings → Qd
 Then chat retrieves top-k chunks from the same Qdrant collection for RAG.
 
 Now includes: **automatic Qdrant Cloud connectivity self-test + REST ping fallback + clearer diagnostics**.
+Also includes: **token budgeting** for prompts so the model always has room to "read" and answer.
 """
 
 import io
@@ -13,7 +14,6 @@ import logging
 from datetime import datetime
 from typing import List, Tuple
 import re
-
 
 import streamlit as st
 from dotenv import load_dotenv, find_dotenv
@@ -57,9 +57,7 @@ def _embedder():
 
 # --- REST ping like curl ---
 def _ping_qdrant_rest() -> tuple[bool, str]:
-    #url = os.getenv("QDRANT_URL", "")
     url = st.secrets["QDRANT_URL"]
-    #key = os.getenv("QDRANT_API_KEY", "")
     key = st.secrets["QDRANT_API_KEY"]
     if not url:
         return False, "QDRANT_URL not set."
@@ -76,22 +74,16 @@ def _ping_qdrant_rest() -> tuple[bool, str]:
 def clean_llm_output(text: str) -> str:
     """
     Uklanja sve <think> tagove i druge poznate meta-oznake iz LLM odgovora.
-    Može se proširiti kasnije za druge tagove poput <reflection>, <note>, itd.
     """
     if not text:
         return ""
-    # ukloni <think> ... </think>
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-    # ukloni <reflection> ... </reflection> ili druge poznate meta tagove
     text = re.sub(r"<reflection>.*?</reflection>", "", text, flags=re.DOTALL)
-    # ukloni višestruke prazne linije
     text = re.sub(r"\n\s*\n", "\n", text)
     return text.strip()
 
 def _mk_qdrant_client_from_url():
-    #raw_url = os.getenv("QDRANT_URL")
     raw_url = st.secrets["QDRANT_URL"]
-    #api_key = os.getenv("QDRANT_API_KEY")
     api_key = st.secrets["QDRANT_API_KEY"]
     if not raw_url:
         raise RuntimeError("QDRANT_URL is not set.")
@@ -110,7 +102,6 @@ def _mk_qdrant_client_from_url():
 
 @st.cache_resource(show_spinner=False)
 def _qdrant() -> Tuple[QdrantClient, str, int]:
-    #coll = os.getenv("QDRANT_COLLECTION", "poslovniModeli")
     coll = st.secrets["QDRANT_COLLECTION"]
     client, host, port, ipv4s = _mk_qdrant_client_from_url()
     try:
@@ -145,9 +136,7 @@ def main():
         selected_model = st.selectbox("Select model", MODEL_OPTIONS, index=0)
         st.divider()
         st.subheader("Vector DB")
-        #q_url = os.getenv("QDRANT_URL")
         q_url = st.secrets["QDRANT_URL"]
-        #q_coll = os.getenv("QDRANT_COLLECTION", "poslovniModeli")
         q_coll = st.secrets["QDRANT_COLLECTION"]
 
         ok_rest, msg_rest = _ping_qdrant_rest()
@@ -172,7 +161,7 @@ def main():
             st.write({
                 "QDRANT_URL": q_url,
                 "QDRANT_COLLECTION": q_coll,
-                "Has Qdrant API key": bool(os.getenv("QDRANT_API_KEY")),
+                "Has Qdrant API key": bool(st.secrets.get("QDRANT_API_KEY")),
                 "Has HF token": bool(os.getenv("HUGGINGFACE_TOKEN")),
                 "Has OpenRouter key": bool(os.getenv("OPENROUTER_API_KEY")),
                 "HTTP_PROXY": os.getenv("HTTP_PROXY"),
@@ -206,13 +195,19 @@ def main():
 
     user_msg = st.chat_input("Pitaj chat što Vas zanima o Alutech-u i njihovim uslugama...")
     if user_msg:
-        context = get_qdrant_context(user_msg, top_k=4)
-        prompt = build_prompt(user_msg, context)
+        contexts = get_qdrant_context(user_msg, top_k=6)  # možeš povisiti K; prompt builder reže višak
+        prompt = build_prompt_with_budget(user_msg, contexts, selected_model, reply_tokens=800)
         reply = get_model_response(prompt, selected_model)
         st.session_state.history.append({"role": "user", "content": user_msg})
         st.session_state.history.append({"role": "assistant", "content": reply})
         with st.sidebar.expander("Last retrieved context", expanded=False):
-            st.write(context or "<no context>")
+            if contexts:
+                st.write([
+                    {"score": f"{s:.3f}", "snippet": t[:240] + ("..." if len(t) > 240 else "")}
+                    for s, t in contexts
+                ])
+            else:
+                st.write("<no context>")
 
     for m in st.session_state.history[-30:]:
         with st.chat_message(m["role"]):
@@ -234,7 +229,6 @@ def extract_text_from_upload(uploaded_file) -> str:
     except Exception as e:
         return f"<extract error: {e}>"
 
-
 def chunk_text(text: str, size: int = 1000, overlap: int = 200) -> List[str]:
     chunks, i = [], 0
     L = len(text)
@@ -242,7 +236,6 @@ def chunk_text(text: str, size: int = 1000, overlap: int = 200) -> List[str]:
         chunks.append(text[i : i + size])
         i += max(1, size - overlap)
     return [c for c in chunks if c.strip()]
-
 
 def upsert_chunks_to_qdrant(chunks: List[str], source_name: str) -> int:
     if not chunks:
@@ -267,42 +260,89 @@ def upsert_chunks_to_qdrant(chunks: List[str], source_name: str) -> int:
         uploaded += len(points)
     return uploaded
 
-
-def get_qdrant_context(query: str, top_k: int = 4) -> str:
+def get_qdrant_context(query: str, top_k: int = 4) -> List[Tuple[float, str]]:
     client, coll, _ = _qdrant()
     qvec = _embedder().encode(query).tolist()
     hits = client.search(collection_name=coll, query_vector=qvec, limit=top_k)
     if not hits:
-        return ""
+        return []
     hits = sorted(hits, key=lambda h: h.score, reverse=True)
-    return "\n\n".join(
-        f"[score={h.score:.3f}] { (h.payload or {}).get('text','') }" for h in hits if (h.payload or {}).get("text")
+    out: List[Tuple[float, str]] = []
+    for h in hits:
+        txt = (h.payload or {}).get("text", "")
+        if txt and txt.strip():
+            out.append((h.score, txt))
+    return out
+
+# -----------------------------
+# Prompt building with token budgeting
+# -----------------------------
+
+def estimate_tokens(text: str) -> int:
+    """Gruba procjena tokena, 4 znaka ~ 1 token (radi za većinu LLM-ova)."""
+    if not text:
+        return 0
+    return max(1, len(text) // 4)
+
+def build_prompt_with_budget(user_question: str,
+                             contexts: List[Tuple[float, str]],
+                             model_choice: str,
+                             reply_tokens: int = 800) -> str:
+    """
+    Složi prompt i kontekst tako da stane u context window modela + ostavi mjesta za odgovor.
+    """
+    # Procjena context window-a po backendu (konzervativno)
+    ctx_windows = {
+        "HF Pro Models": 8192,
+        "HF Standard Models": 8192,
+        "DeepSeek R1 (cloud)": 16384,
+    }
+    max_ctx = ctx_windows.get(model_choice, 8192)
+
+    header = (
+        "Tvoj zadatak je odgovoriti na korisničko pitanje koristeći ISKLJUČIVO informacije iz sljedećeg konteksta.\n\n"
+        "🎯 CILJ:\n"
+        "Daj jasan, sažet i točan odgovor koji pokriva bit pitanja tako da korisnik odmah dobije najveću moguću vrijednost.\n\n"
+        "📜 PRAVILA:\n"
+        "- Koristi isključivo informacije iz danog konteksta (nema izmišljanja).\n"
+        "- Ako kontekst ne sadrži odgovor, reci to izravno (\"Nema dovoljno informacija u dostupnim dokumentima.\").\n"
+        "- Odgovaraj isključivo na hrvatskom jeziku, gramatički i stilski prirodno.\n"
+        "- Izbjegavaj meta-komentare, razmišljanja, oznake poput <think> i slično.\n"
+        "- Odgovor formuliraj kao da si stručnjak koji zna objasniti jasno i profesionalno, ali bez suvišne formalnosti.\n"
+        "- Poželjno je da prvi redak odmah sadrži sažeti odgovor, a ako je potrebno, ispod možeš dodati kratko pojašnjenje.\n\n"
+        "📚 KONTEKST:\n"
     )
+    footer = f"\n\n❓ PITANJE KORISNIKA:\n{user_question}\n\n💬 ODGOVOR:\n"
 
+    # Rezerviraj tokene za header, footer i odgovor
+    header_tokens = estimate_tokens(header)
+    footer_tokens = estimate_tokens(footer)
+    budget = max_ctx - reply_tokens - header_tokens - footer_tokens
+    if budget < 256:
+        budget = 256  # safety net
 
-def build_prompt(user_question: str, context: str) -> str:
-    return f"""
-Tvoj zadatak je odgovoriti na korisničko pitanje koristeći ISKLJUČIVO informacije iz sljedećeg konteksta.
+    # Spakiraj kontekst dok ima budžeta
+    context_blob = []
+    used = 0
+    for score, text in contexts:
+        if not text:
+            continue
+        line = f"[score={score:.3f}] {text}\n\n"
+        t = estimate_tokens(line)
+        if used + t > budget:
+            remaining_tokens = max(0, budget - used)
+            remaining_chars = remaining_tokens * 4
+            if remaining_chars > 64:  # izbjegni trivijalne repove
+                line = line[:remaining_chars]
+                context_blob.append(line)
+                used += estimate_tokens(line)
+            break
+        context_blob.append(line)
+        used += t
 
-🎯 CILJ:
-Daj jasan, sažet i točan odgovor koji pokriva bit pitanja tako da korisnik odmah dobije najveću moguću vrijednost.
-
-📜 PRAVILA:
-- Koristi isključivo informacije iz danog konteksta (nema izmišljanja).
-- Ako kontekst ne sadrži odgovor, reci to izravno ("Nema dovoljno informacija u dostupnim dokumentima.").
-- Odgovaraj isključivo na hrvatskom jeziku, gramatički i stilski prirodno.
-- Izbjegavaj meta-komentare, razmišljanja, oznake poput <think> i slično.
-- Odgovor formuliraj kao da si stručnjak koji zna objasniti jasno i profesionalno, ali bez suvišne formalnosti.
-- Poželjno je da prvi redak odmah sadrži sažeti odgovor, a ako je potrebno, ispod možeš dodati kratko pojašnjenje.
-
-📚 KONTEKST:
-{context or '<nema dostupnog konteksta>'}
-
-❓ PITANJE KORISNIKA:
-{user_question}
-
-💬 ODGOVOR:
-"""
+    context_text = "".join(context_blob) if context_blob else "<nema dostupnog konteksta>"
+    prompt = f"{header}{context_text}{footer}"
+    return prompt
 
 
 # -----------------------------
@@ -316,21 +356,16 @@ except Exception:
 from huggingface_hub import InferenceClient
 
 def get_model_response(prompt: str, model_choice: str) -> str:
-    # --- Hugging Face Pro Models (using latest Inference Providers) ---
+    # --- Hugging Face Pro Models ---
     if model_choice == "HF Pro Models":
         hf_token = os.environ.get("HUGGINGFACE_TOKEN")
         if not hf_token:
             return "Please set HUGGINGFACE_TOKEN environment variable for HF Pro access."
-        
         try:
-            # Use the latest Inference Providers system - routed through HF
             client = InferenceClient(token=hf_token)
-            
-            # Try chat completion with popular models that support it
             chat_models = [
                 "HuggingFaceTB/SmolLM3-3B"
-                ]
-            
+            ]
             for model_id in chat_models:
                 try:
                     messages = [{"role": "user", "content": prompt}]
@@ -341,20 +376,17 @@ def get_model_response(prompt: str, model_choice: str) -> str:
                         temperature=0.7,
                         stream=False
                     )
-                    #return response.choices[0].message.content.strip()
                     raw_text = response.choices[0].message.content
                     return clean_llm_output(raw_text)
                 except Exception as e:
                     logging.info(f"Chat model {model_id} failed: {e}")
                     continue
-            
-            # Fallback to text generation models
+
             text_models = [
                 "gpt2-large",
                 "EleutherAI/gpt-neo-2.7B",
                 "bigscience/bloom-1b7",
             ]
-            
             for model_id in text_models:
                 try:
                     response = client.text_generation(
@@ -372,8 +404,7 @@ def get_model_response(prompt: str, model_choice: str) -> str:
                 except Exception as e:
                     logging.info(f"Text model {model_id} failed: {e}")
                     continue
-            
-            # Final fallback - let HF choose the model
+
             try:
                 response = client.text_generation(
                     prompt,
@@ -388,31 +419,25 @@ def get_model_response(prompt: str, model_choice: str) -> str:
                     return clean_llm_output(result)
             except Exception as e:
                 logging.info(f"Default model failed: {e}")
-            
+
         except Exception as e:
-            # Check if it's an old version issue
             if "unexpected keyword argument 'provider'" in str(e):
                 return "Please upgrade huggingface_hub: pip install --upgrade huggingface_hub"
             return f"HF Pro error: {e}"
-        
+
         return "All HF models failed. This might be a temporary API issue."
 
-    # --- Hugging Face with Third-Party Providers (Latest feature) ---
+    # --- Hugging Face with Third-Party Providers ---
     if model_choice == "HF Standard Models":
         hf_token = os.environ.get("HUGGINGFACE_TOKEN")
-
         if not hf_token:
             return "HUGGINGFACE_TOKEN environment variable is not set."
-
         try:
-            # List of third-party providers and respective models
             providers_to_try = [
                 ("together", "meta-llama/Llama-3.2-3B-Instruct"),
                 ("fireworks", "accounts/fireworks/models/llama-v3p1-8b-instruct"),
                 ("replicate", "meta/llama-2-7b-chat"),
             ]
-
-            # Try each provider sequentially
             for provider, model_id in providers_to_try:
                 try:
                     client = InferenceClient(provider=provider, token=hf_token)
@@ -424,7 +449,6 @@ def get_model_response(prompt: str, model_choice: str) -> str:
                         temperature=0.7,
                         stream=False
                     )
-                    #return response.choices[0].message.content.strip()
                     raw_text = response.choices[0].message.content
                     return clean_llm_output(raw_text)
 
@@ -432,10 +456,8 @@ def get_model_response(prompt: str, model_choice: str) -> str:
                     logging.info(f"Provider {provider} failed: {e}")
                     continue
 
-            # Fallback to basic Hugging Face models without provider param
             client = InferenceClient(token=hf_token)
             basic_models = ["gpt2", "distilgpt2", "gpt2-medium"]
-
             for model_id in basic_models:
                 try:
                     response = client.text_generation(
@@ -459,18 +481,13 @@ def get_model_response(prompt: str, model_choice: str) -> str:
 
         return "All HF standard models failed."
 
-    # else:
-    #     return "Model choice is not HF Standard Models."
-
-    # --- DeepSeek via OpenRouter (backup option) ---
+    # --- DeepSeek via OpenRouter ---
     if model_choice == "DeepSeek R1 (cloud)":
         if not OpenAI:
             return "DeepSeek R1 backend unavailable. Please install openai package."
-        
         openrouter_key = os.getenv("OPENROUTER_API_KEY")
         if not openrouter_key:
             return "Please set OPENROUTER_API_KEY environment variable."
-            
         client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=openrouter_key)
         try:
             completion = client.chat.completions.create(
@@ -479,35 +496,11 @@ def get_model_response(prompt: str, model_choice: str) -> str:
                 max_tokens=1200,
                 temperature=0.7,
             )
-
-            raw_text = completion.choices[0].message.content  # DeepSeek
+            raw_text = completion.choices[0].message.content
             clean_text = clean_llm_output(raw_text)
             return clean_text
         except Exception as e:
             return f"DeepSeek R1 error: {e}"
-
-    # # --- Local/Offline (basic response) ---
-    # if model_choice == "Local/Offline":
-    #     # Simple pattern-based responses for when no API is available
-    #     context_lines = prompt.split('\n')
-    #     context_text = ""
-    #     for line in context_lines:
-    #         if "Context:" in line:
-    #             idx = context_lines.index(line)
-    #             context_text = '\n'.join(context_lines[idx+1:])
-    #             break
-        
-    #     if "no context" in context_text.lower() or len(context_text.strip()) < 10:
-    #         return "I don't have enough context from your uploaded documents to answer this question. Could you please upload some relevant documents first?"
-        
-    #     # Extract key information from context
-    #     lines = [line.strip() for line in context_text.split('\n') if line.strip() and not line.startswith('[score=')]
-    #     if lines:
-    #         return f"Based on your uploaded documents: {' '.join(lines[:3])}... Please note this is a simplified response. For better answers, configure HF Pro or other AI model APIs."
-        
-    #     return "No relevant information found in uploaded documents for your question."
-
-    # return "Model not implemented."
 
 if __name__ == "__main__":
     main()
