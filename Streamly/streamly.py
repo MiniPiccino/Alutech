@@ -18,7 +18,8 @@ import logging
 from datetime import datetime
 from typing import List, Tuple, Optional
 import re
-
+import hashlib
+import math
 import streamlit as st
 from dotenv import load_dotenv, find_dotenv
 from sentence_transformers import SentenceTransformer
@@ -75,10 +76,15 @@ def _ping_qdrant_rest() -> tuple[bool, str]:
 def clean_llm_output(text: str) -> str:
     if not text:
         return ""
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-    text = re.sub(r"<reflection>.*?</reflection>", "", text, flags=re.DOTALL)
-    text = re.sub(r"\n\s*\n", "\n", text)
-    return text.strip()
+    import re
+    s = text
+    s = re.sub(r"(?is)<\s*(think|thinking|analysis|reasoning)[^>]*>.*?<\s*/\s*\1\s*>", "", s)
+    s = re.sub(r"(?is)```(?:thinking|think|analysis|reasoning|xml).*?```", "", s)
+    s = re.sub(r"(?im)^\s*(Thought|Thinking|Analysis|Reasoning)\s*:\s.*?$", "", s)
+    s = re.sub(r"(?is)<\s*reflection[^>]*>.*?<\s*/\s*reflection\s*>", "", s)
+    s = re.sub(r"\n{3,}", "\n\n", s).strip()
+    return s
+
 
 def _mk_qdrant_client_from_url():
     raw_url = st.secrets["QDRANT_URL"]
@@ -225,13 +231,20 @@ def main():
         with st.spinner("Embedding and uploading to Qdrant..."):
             total_chunks = 0
             for f in uploaded_files:
-                text = extract_text_from_upload(f)
-                if not text.strip():
-                    st.warning(f"No text extracted from {f.name} – skipped.")
-                    continue
-                chunks = chunk_text(text, size=1000, overlap=200)
+                pages = extract_text_from_upload(f)  # [{page, text}, ...]
+                # slideri ako želiš (ili fiksno):
+                chunk_size = 1000
+                chunk_overlap = 200
+                chunks = make_chunks_from_pages(pages, size=chunk_size, overlap=chunk_overlap)
+                st.info(f"{f.name}: {len(chunks)} chunkova (size={chunk_size}, overlap={chunk_overlap})")
                 n = upsert_chunks_to_qdrant(chunks, source_name=f.name)
-                total_chunks += n
+                # text = extract_text_from_upload(f)
+                # if not text.strip():
+                #     st.warning(f"No text extracted from {f.name} – skipped.")
+                #     continue
+                # chunks = chunk_text(text, size=1000, overlap=200)
+                # n = upsert_chunks_to_qdrant(chunks, source_name=f.name)
+                # total_chunks += n
             st.success(f"Finished ingestion. Total chunks upserted: {total_chunks}")
 
     # Chat
@@ -268,24 +281,77 @@ def main():
 # -----------------------------
 # RAG helpers
 # -----------------------------
-def extract_text_from_upload(uploaded_file) -> str:
+def extract_text_from_upload(uploaded_file) -> List[dict]:
+    """
+    Vrati listu: [{"page": 1, "text": "..."} , ...]
+    Ako je TXT, tretiraj sve kao jednu stranicu.
+    """
     name = uploaded_file.name.lower()
+    records = []
     try:
         if name.endswith(".pdf"):
-            reader = PyPDF2.PdfReader(io.BytesIO(uploaded_file.read()))
-            return "".join(page.extract_text() or "" for page in reader.pages)
+            data = uploaded_file.read()
+            reader = PyPDF2.PdfReader(io.BytesIO(data))
+            for i, page in enumerate(reader.pages):
+                try:
+                    txt = page.extract_text() or ""
+                except Exception:
+                    txt = ""
+                records.append({"page": i+1, "text": txt})
         else:
-            return uploaded_file.read().decode("utf-8", errors="ignore")
+            txt = uploaded_file.read().decode("utf-8", errors="ignore")
+            records.append({"page": 1, "text": txt})
     except Exception as e:
-        return f"<extract error: {e}>"
+        records.append({"page": 1, "text": f"<extract error: {e}>"})
+    return records
 
-def chunk_text(text: str, size: int = 1000, overlap: int = 200) -> List[str]:
-    chunks, i = [], 0
-    L = len(text)
-    while i < L:
-        chunks.append(text[i : i + size])
-        i += max(1, size - overlap)
-    return [c for c in chunks if c.strip()]
+
+
+def _split_sentences(text: str) -> List[str]:
+    # jednostavan, bez ovisnosti: razdvajanje po . ! ? ; + novi redovi
+    text = re.sub(r"[ \t]+", " ", text)
+    parts = re.split(r"(?<=[\.\!\?\;])\s+|\n{2,}", text)
+    return [p.strip() for p in parts if p and p.strip()]
+
+def chunk_text_smart(text: str, size: int = 1000, overlap: int = 200) -> List[str]:
+    """
+    Pametno puni chunkove cjelovitim rečenicama/odlomcima dok je blizu ciljane veličine.
+    """
+    if not text or not text.strip():
+        return []
+    sents = _split_sentences(text)
+    chunks, cur = [], ""
+    target = max(200, size)
+    for s in sents:
+        if len(cur) + len(s) + 1 <= target:
+            cur = (cur + " " + s).strip() if cur else s
+        else:
+            # zatvori chunk
+            if cur:
+                chunks.append(cur)
+            # startaj novi; uključi malo overlap-a iz prethodnog kraja
+            if overlap > 0 and chunks:
+                tail = chunks[-1][-overlap:]
+                cur = (tail + " " + s).strip()
+            else:
+                cur = s
+    if cur:
+        chunks.append(cur)
+    # očisti praznine
+    return [c.strip() for c in chunks if c.strip()]
+
+def make_chunks_from_pages(pages: List[dict], size: int = 1000, overlap: int = 200) -> List[dict]:
+    """
+    Iz liste {page, text} napravi listu chunkova s meta: {text, page, chunk_idx_on_page}
+    """
+    out = []
+    for rec in pages:
+        page = rec["page"]
+        txt = rec.get("text","") or ""
+        page_chunks = chunk_text_smart(txt, size=size, overlap=overlap)
+        for i, c in enumerate(page_chunks):
+            out.append({"text": c, "page": page, "chunk_idx_on_page": i})
+    return out
 
 import time
 
@@ -331,30 +397,49 @@ def reset_collection() -> str:
     return coll
 
 
-def upsert_chunks_to_qdrant(chunks: List[str], source_name: str) -> int:
+def _hash_text(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()
+
+def upsert_chunks_to_qdrant(chunks: List[dict], source_name: str) -> int:
+    """
+    OČEKUJE: listu dict-ova {text, page, chunk_idx_on_page}
+    Piše idempotentno: point.id = SHA256(text) (sprječava duplikate).
+    """
     if not chunks:
         return 0
     client, coll, _ = _qdrant()
     embedder = _embedder()
-    BATCH = 256
+    BATCH = 128
     uploaded = 0
     now_iso = datetime.utcnow().isoformat() + "Z"
-    # ensure index (in slučaju prvog ingest-a)
+
+    # osiguraj FT index
     ensure_fulltext_index(client, coll, field_name="text")
+
     for i in range(0, len(chunks), BATCH):
         batch = chunks[i : i + BATCH]
-        vecs = embedder.encode(batch, show_progress_bar=False).tolist()
-        points = [
-            qmodels.PointStruct(
-                id=str(uuid.uuid4()),
-                vector=vecs[k],
-                payload={"text": batch[k], "source": source_name, "uploaded_at": now_iso},
+        texts = [b["text"] for b in batch]
+        vecs = embedder.encode(texts, show_progress_bar=False).tolist()
+        points = []
+        for k, ch in enumerate(batch):
+            pid = _hash_text(ch["text"])
+            points.append(
+                qmodels.PointStruct(
+                    id=pid,
+                    vector=vecs[k],
+                    payload={
+                        "text": ch["text"],
+                        "source": source_name,
+                        "page": ch.get("page"),
+                        "chunk_idx_on_page": ch.get("chunk_idx_on_page"),
+                        "uploaded_at": now_iso,
+                    },
+                )
             )
-            for k in range(len(batch))
-        ]
         client.upsert(collection_name=coll, points=points, wait=True)
         uploaded += len(points)
     return uploaded
+
 
 def qdrant_count() -> int:
     client, coll, _ = _qdrant()
