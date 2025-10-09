@@ -1,0 +1,13 @@
+streamlit
+transformers
+Pillow
+python-dotenv
+requests
+PyPDF2
+chromadb
+openai
+huggingface_hub
+streamlit==1.38.0
+qdrant-client==1.9.0
+sentence-transformers==2.7.0
+PyPDF2==3.0.1
