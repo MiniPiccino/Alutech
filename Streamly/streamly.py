@@ -265,15 +265,28 @@ def get_qdrant_context(query: str, top_k: int = 4) -> str:
 
 
 def build_prompt(user_question: str, context: str) -> str:
-    return (
-        f"Use the following context to answer the user's question:\n\n"
-        f"Please use only information from the documents give concise answer that will asnwer most following questions immediatelly\n\n"
-        f"Please answer without showing your internal thought process or meta-comments like <think>.\n\n"
-        f"Please answer in croatian all the time.\n\n"
-        f"Context:\n{context or '<none>'}\n\n"
-        f"User question: {user_question}\n"
-        "Answer:"
-    )
+    return f"""
+Tvoj zadatak je odgovoriti na korisničko pitanje koristeći ISKLJUČIVO informacije iz sljedećeg konteksta.
+
+🎯 CILJ:
+Daj jasan, sažet i točan odgovor koji pokriva bit pitanja tako da korisnik odmah dobije najveću moguću vrijednost.
+
+📜 PRAVILA:
+- Koristi isključivo informacije iz danog konteksta (nema izmišljanja).
+- Ako kontekst ne sadrži odgovor, reci to izravno ("Nema dovoljno informacija u dostupnim dokumentima.").
+- Odgovaraj isključivo na hrvatskom jeziku, gramatički i stilski prirodno.
+- Izbjegavaj meta-komentare, razmišljanja, oznake poput <think> i slično.
+- Odgovor formuliraj kao da si stručnjak koji zna objasniti jasno i profesionalno, ali bez suvišne formalnosti.
+- Poželjno je da prvi redak odmah sadrži sažeti odgovor, a ako je potrebno, ispod možeš dodati kratko pojašnjenje.
+
+📚 KONTEKST:
+{context or '<nema dostupnog konteksta>'}
+
+❓ PITANJE KORISNIKA:
+{user_question}
+
+💬 ODGOVOR:
+"""
 
 
 # -----------------------------
