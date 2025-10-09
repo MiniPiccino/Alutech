@@ -185,6 +185,16 @@ def main():
         if st.button("Retry connection", use_container_width=True):
             st.cache_resource.clear()
             st.rerun()
+        if st.button("Reset collection (nuke & rebuild)", type="primary", use_container_width=True):
+            try:
+                new_coll = reset_collection()
+                st.success(f"Collection '{new_coll}' recreated ✔️")
+                # očisti cache resurse (client/collection/meta) i relaunch
+                st.cache_resource.clear()
+                st.rerun()
+            except Exception as e:
+                st.error(f"Reset failed: {e}")
+
 
         # count
         try:
@@ -276,6 +286,50 @@ def chunk_text(text: str, size: int = 1000, overlap: int = 200) -> List[str]:
         chunks.append(text[i : i + size])
         i += max(1, size - overlap)
     return [c for c in chunks if c.strip()]
+
+import time
+
+def reset_collection() -> str:
+    """Delete + recreate Qdrant kolekciju i ponovno podesi indekse."""
+    client, coll, _ = _qdrant()
+    try:
+        client.delete_collection(coll)
+    except Exception as e:
+        logging.info(f"Delete collection warning (ignorable ako ne postoji): {e}")
+
+    # Ponekad backend treba trenutak da stvarno obriše
+    for _ in range(20):
+        try:
+            client.create_collection(
+                collection_name=coll,
+                vectors_config=qmodels.VectorParams(
+                    size=_embedder().get_sentence_embedding_dimension(),
+                    distance=qmodels.Distance.COSINE,
+                ),
+                timeout=30,
+            )
+            break
+        except Exception as e:
+            # Ako i dalje briše, pričekaj pa pokušaj opet
+            time.sleep(0.25)
+    else:
+        raise RuntimeError("Could not recreate collection (still deleting?).")
+
+    # (Re)create any payload indexes you use (text/doc_id/hash/etc.)
+    ensure_fulltext_index(client, coll, field_name="text")
+    # Ako koristiš dedup: indeksiraj i hash/doc_id/source
+    try:
+        for field in ("hash", "doc_id", "source"):
+            client.create_payload_index(
+                collection_name=coll,
+                field_name=field,
+                field_schema=qmodels.PayloadSchemaType.KEYWORD,
+            )
+    except Exception:
+        pass  # već postoji — ok
+
+    return coll
+
 
 def upsert_chunks_to_qdrant(chunks: List[str], source_name: str) -> int:
     if not chunks:
