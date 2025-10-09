@@ -422,16 +422,19 @@ def upsert_chunks_to_qdrant(chunks: List[dict], source_name: str) -> int:
         vecs = embedder.encode(texts, show_progress_bar=False).tolist()
         points = []
         for k, ch in enumerate(batch):
-            pid = _hash_text(ch["text"])
+            txt = ch["text"]
+            # deterministički, ali Qdrant-validan ID: UUIDv5 iz sadržaja chunka
+            pid_uuid = uuid.uuid5(uuid.NAMESPACE_URL, txt)
             points.append(
                 qmodels.PointStruct(
-                    id=pid,
+                    id=str(pid_uuid),  # ✅ valjan UUID string s crtama
                     vector=vecs[k],
                     payload={
-                        "text": ch["text"],
+                        "text": txt,
                         "source": source_name,
                         "page": ch.get("page"),
                         "chunk_idx_on_page": ch.get("chunk_idx_on_page"),
+                        "hash": _hash_text(txt),          # zadrži hash u payloadu (za dedup/filtriranje)
                         "uploaded_at": now_iso,
                     },
                 )
