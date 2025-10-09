@@ -441,7 +441,7 @@ def get_model_response(prompt: str, model_choice: str) -> str:
         client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=openrouter_key)
         try:
             completion = client.chat.completions.create(
-                model="deepseek/deepseek-r1-0528:free",
+                model="deepseek/deepseek-chat-v3.1:free",
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=1200,
                 temperature=0.7,
