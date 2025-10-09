@@ -3,12 +3,23 @@
 Streamlit app: users upload documents (PDF/TXT) → chunks → embeddings → Qdrant.
 RAG preko Qdranta (semantic + full-text + keyword fallback) s token budgetingom.
 
-Uključuje:
-- Qdrant Cloud self-test + REST ping
-- Automatsko kreiranje kolekcije i FULL-TEXT indeksa nad payload.text
-- Dohvat konteksta: semantic → full-text → keyword scroll (reranking po sličnosti)
-- Token budgeting (prompt uvijek ostavlja mjesta za odgovor)
-- Dijagnostika: broj točaka u kolekciji
+Major updates (HR-first & robust retrieval):
+- Multilingual E5 embeddings: intfloat/multilingual-e5-base (bolji HR↔EN semantički match).
+- E5 prefixes: 'query:' i 'passage:' za konzistentne vektore.
+- Dvojezična i sinonimska ekspanzija upita (direktor/ravnatelj/predsjednik + EN prijevod).
+- Ne prevodimo PROMPT (kontekst ostaje točan); eventualno prevodimo SAMO ODGOVOR natrag u HR.
+- Heuristike za kvalitetu HR odgovora.
+- Ispravke: total_chunks akumulacija, dijagnostika, i sitni cleanup.
+
+Dependencies:
+pip install streamlit python-dotenv sentence-transformers qdrant-client PyPDF2 huggingface_hub transformers langdetect requests
+
+Environment/Secrets (Streamlit):
+- st.secrets["QDRANT_URL"] (https://<cluster>.<region>.qdrant.tech:443)
+- st.secrets["QDRANT_API_KEY"]
+- st.secrets["QDRANT_COLLECTION"]
+- env HUGGINGFACE_TOKEN (for HF Inference)
+- env OPENROUTER_API_KEY (optional, for DeepSeek route)
 """
 
 import io
@@ -16,19 +27,39 @@ import os
 import uuid
 import logging
 from datetime import datetime
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 import re
 import hashlib
 import math
+import time
+import socket
+import urllib.parse
+
 import streamlit as st
 from dotenv import load_dotenv, find_dotenv
+import requests
+import PyPDF2
+
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
-import PyPDF2
-import requests, urllib.parse, socket
 
-# Load .env
+# Language detection & translation
+from langdetect import detect, DetectorFactory
+DetectorFactory.seed = 0
+from transformers import pipeline
+
+# Optional OpenRouter
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
+
+from huggingface_hub import InferenceClient
+
+# -----------------------------
+# Init
+# -----------------------------
 _dotenv_path = find_dotenv(usecwd=True)
 load_dotenv(_dotenv_path, override=False)
 logging.basicConfig(level=logging.INFO)
@@ -54,13 +85,34 @@ _apply_proxy_bypass()
 # Cached resources
 # -----------------------------
 @st.cache_resource(show_spinner=False)
-def _embedder():
-    return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+def _embedder() -> SentenceTransformer:
+    # Multilingual, strong cross-lingual retrieval
+    return SentenceTransformer("intfloat/multilingual-e5-base")
+
+def _add_e5_prefix(s: str, kind: str) -> str:
+    return f"{kind}: {s.strip()}" if s else f"{kind}:"
+
+@st.cache_resource(show_spinner=False)
+def _translator_to_en():
+    return pipeline("translation", model="Helsinki-NLP/opus-mt-hr-en", device_map="auto")
+
+@st.cache_resource(show_spinner=False)
+def _translator_to_hr():
+    return pipeline("translation", model="Helsinki-NLP/opus-mt-en-hr", device_map="auto")
+
+def _encode_query(text: str):
+    return _embedder().encode(_add_e5_prefix(text, "query"), show_progress_bar=False)
+
+def _encode_passages(texts: List[str]):
+    return _embedder().encode([_add_e5_prefix(t, "passage") for t in texts], show_progress_bar=False)
+
+def _encode_passage(text: str):
+    return _embedder().encode(_add_e5_prefix(text, "passage"), show_progress_bar=False)
 
 # --- REST ping like curl ---
 def _ping_qdrant_rest() -> tuple[bool, str]:
-    url = st.secrets["QDRANT_URL"]
-    key = st.secrets["QDRANT_API_KEY"]
+    url = st.secrets.get("QDRANT_URL")
+    key = st.secrets.get("QDRANT_API_KEY")
     if not url:
         return False, "QDRANT_URL not set."
     try:
@@ -76,7 +128,6 @@ def _ping_qdrant_rest() -> tuple[bool, str]:
 def clean_llm_output(text: str) -> str:
     if not text:
         return ""
-    import re
     s = text
     s = re.sub(r"(?is)<\s*(think|thinking|analysis|reasoning)[^>]*>.*?<\s*/\s*\1\s*>", "", s)
     s = re.sub(r"(?is)```(?:thinking|think|analysis|reasoning|xml).*?```", "", s)
@@ -85,10 +136,12 @@ def clean_llm_output(text: str) -> str:
     s = re.sub(r"\n{3,}", "\n\n", s).strip()
     return s
 
-
+# -----------------------------
+# Qdrant client & collection
+# -----------------------------
 def _mk_qdrant_client_from_url():
-    raw_url = st.secrets["QDRANT_URL"]
-    api_key = st.secrets["QDRANT_API_KEY"]
+    raw_url = st.secrets.get("QDRANT_URL")
+    api_key = st.secrets.get("QDRANT_API_KEY")
     if not raw_url:
         raise RuntimeError("QDRANT_URL is not set.")
     u = urllib.parse.urlparse(raw_url)
@@ -113,7 +166,7 @@ def _qdrant() -> Tuple[QdrantClient, str, int]:
         raise RuntimeError(
             f"Cannot reach Qdrant via qdrant-client. Host={host} Port={port} IPv4={ipv4s}\nError: {e}"
         )
-    emb_dim = len(_embedder().encode("dim-probe"))
+    emb_dim = len(_encode_query("dim-probe"))
     # create collection if missing
     try:
         client.get_collection(coll)
@@ -128,17 +181,12 @@ def _qdrant() -> Tuple[QdrantClient, str, int]:
     return client, coll, emb_dim
 
 def ensure_fulltext_index(client: QdrantClient, coll: str, field_name: str = "text"):
-    """
-    Pokuša kreirati/namjestiti FULL-TEXT indeks nad payload poljem 'text'.
-    Radi i ako je već postojao (ignorira grešku).
-    """
     try:
-        # Qdrant full-text (word tokenizer, lowercase)
         client.create_payload_index(
             collection_name=coll,
             field_name=field_name,
             field_schema=qmodels.TextIndexParams(
-                type="text",                   # ekvivalent PayloadSchemaType.TEXT
+                type="text",
                 tokenizer=qmodels.TokenizerType.WORD,
                 min_token_len=2,
                 lowercase=True,
@@ -146,8 +194,7 @@ def ensure_fulltext_index(client: QdrantClient, coll: str, field_name: str = "te
                 use_diacritics=False,
             ),
         )
-    except Exception as e:
-        # Ako već postoji ili verzija ne podržava detaljne parametre, probaj minimalnu definiciju
+    except Exception:
         try:
             client.create_payload_index(
                 collection_name=coll,
@@ -155,7 +202,6 @@ def ensure_fulltext_index(client: QdrantClient, coll: str, field_name: str = "te
                 field_schema=qmodels.PayloadSchemaType.TEXT
             )
         except Exception:
-            # Najvjerojatnije već postoji — to je ok.
             pass
 
 # -----------------------------
@@ -164,15 +210,15 @@ def ensure_fulltext_index(client: QdrantClient, coll: str, field_name: str = "te
 def main():
     st.set_page_config(page_title="Document Chatbot", page_icon="💬", layout="wide")
     st.title("Document Chatbot (Qdrant)")
-    st.caption("Upload PDF/TXT. We embed, store in Qdrant Cloud, and chat over your docs.")
+    st.caption("Upload PDF/TXT. We embed, store in Qdrant Cloud, and chat over your docs. (HR-first)")
 
-    MODEL_OPTIONS = ["HF Pro Models", "HF Standard Models", "DeepSeek R1 (cloud)"]
+    MODEL_OPTIONS = ["HF Pro Models (HR-first)", "HF Standard Models (router)", "DeepSeek R1 (cloud)"]
     with st.sidebar:
         selected_model = st.selectbox("Select model", MODEL_OPTIONS, index=0)
         st.divider()
         st.subheader("Vector DB")
-        q_url = st.secrets["QDRANT_URL"]
-        q_coll = st.secrets["QDRANT_COLLECTION"]
+        q_url = st.secrets.get("QDRANT_URL")
+        q_coll = st.secrets.get("QDRANT_COLLECTION")
 
         ok_rest, msg_rest = _ping_qdrant_rest()
         if ok_rest:
@@ -195,14 +241,11 @@ def main():
             try:
                 new_coll = reset_collection()
                 st.success(f"Collection '{new_coll}' recreated ✔️")
-                # očisti cache resurse (client/collection/meta) i relaunch
                 st.cache_resource.clear()
                 st.rerun()
             except Exception as e:
                 st.error(f"Reset failed: {e}")
 
-
-        # count
         try:
             c = qdrant_count()
             st.info(f"Broj vektora u kolekciji **{q_coll}**: {c}")
@@ -231,20 +274,13 @@ def main():
         with st.spinner("Embedding and uploading to Qdrant..."):
             total_chunks = 0
             for f in uploaded_files:
-                pages = extract_text_from_upload(f)  # [{page, text}, ...]
-                # slideri ako želiš (ili fiksno):
+                pages = extract_text_from_upload(f)
                 chunk_size = 1000
                 chunk_overlap = 200
                 chunks = make_chunks_from_pages(pages, size=chunk_size, overlap=chunk_overlap)
                 st.info(f"{f.name}: {len(chunks)} chunkova (size={chunk_size}, overlap={chunk_overlap})")
                 n = upsert_chunks_to_qdrant(chunks, source_name=f.name)
-                # text = extract_text_from_upload(f)
-                # if not text.strip():
-                #     st.warning(f"No text extracted from {f.name} – skipped.")
-                #     continue
-                # chunks = chunk_text(text, size=1000, overlap=200)
-                # n = upsert_chunks_to_qdrant(chunks, source_name=f.name)
-                # total_chunks += n
+                total_chunks += n
             st.success(f"Finished ingestion. Total chunks upserted: {total_chunks}")
 
     # Chat
@@ -252,14 +288,14 @@ def main():
     if "history" not in st.session_state:
         st.session_state.history = []
 
-    user_msg = st.chat_input("Pitaj chat što Vas zanima o Alutech-u i njihovim uslugama...")
+    user_msg = st.chat_input("Pitaj chat bilo što o učitanim dokumentima (na hrvatskom ili engleskom)...")
     if user_msg:
-        contexts = get_context_smart(user_msg, top_k=10, min_vec_score=0.25)  # semantic → full-text → keyword
+        contexts = get_context_smart(user_msg, top_k=10, min_vec_score=0.25)
         if not contexts:
             reply = compose_noinfo_reply(user_msg)
         else:
             prompt = build_prompt_with_budget(user_msg, contexts, selected_model, reply_tokens=800)
-            reply = get_model_response(prompt, selected_model)
+            reply = get_model_response(prompt, selected_model, user_lang_guess=safe_detect(user_msg))
             reply = clean_llm_output(reply)
 
         st.session_state.history.append({"role": "user", "content": user_msg})
@@ -305,18 +341,13 @@ def extract_text_from_upload(uploaded_file) -> List[dict]:
         records.append({"page": 1, "text": f"<extract error: {e}>"})
     return records
 
-
-
 def _split_sentences(text: str) -> List[str]:
-    # jednostavan, bez ovisnosti: razdvajanje po . ! ? ; + novi redovi
+    # jednostavan: razdvajanje po . ! ? ; + dvostruki novi red
     text = re.sub(r"[ \t]+", " ", text)
     parts = re.split(r"(?<=[\.\!\?\;])\s+|\n{2,}", text)
     return [p.strip() for p in parts if p and p.strip()]
 
 def chunk_text_smart(text: str, size: int = 1000, overlap: int = 200) -> List[str]:
-    """
-    Pametno puni chunkove cjelovitim rečenicama/odlomcima dok je blizu ciljane veličine.
-    """
     if not text or not text.strip():
         return []
     sents = _split_sentences(text)
@@ -326,10 +357,8 @@ def chunk_text_smart(text: str, size: int = 1000, overlap: int = 200) -> List[st
         if len(cur) + len(s) + 1 <= target:
             cur = (cur + " " + s).strip() if cur else s
         else:
-            # zatvori chunk
             if cur:
                 chunks.append(cur)
-            # startaj novi; uključi malo overlap-a iz prethodnog kraja
             if overlap > 0 and chunks:
                 tail = chunks[-1][-overlap:]
                 cur = (tail + " " + s).strip()
@@ -337,13 +366,9 @@ def chunk_text_smart(text: str, size: int = 1000, overlap: int = 200) -> List[st
                 cur = s
     if cur:
         chunks.append(cur)
-    # očisti praznine
     return [c.strip() for c in chunks if c.strip()]
 
 def make_chunks_from_pages(pages: List[dict], size: int = 1000, overlap: int = 200) -> List[dict]:
-    """
-    Iz liste {page, text} napravi listu chunkova s meta: {text, page, chunk_idx_on_page}
-    """
     out = []
     for rec in pages:
         page = rec["page"]
@@ -353,37 +378,29 @@ def make_chunks_from_pages(pages: List[dict], size: int = 1000, overlap: int = 2
             out.append({"text": c, "page": page, "chunk_idx_on_page": i})
     return out
 
-import time
-
 def reset_collection() -> str:
-    """Delete + recreate Qdrant kolekciju i ponovno podesi indekse."""
     client, coll, _ = _qdrant()
     try:
         client.delete_collection(coll)
     except Exception as e:
-        logging.info(f"Delete collection warning (ignorable ako ne postoji): {e}")
-
-    # Ponekad backend treba trenutak da stvarno obriše
+        logging.info(f"Delete collection warning (maybe missing): {e}")
+    # recreate (with backoff)
     for _ in range(20):
         try:
             client.create_collection(
                 collection_name=coll,
                 vectors_config=qmodels.VectorParams(
-                    size=_embedder().get_sentence_embedding_dimension(),
+                    size=len(_encode_query("dimension-probe")),
                     distance=qmodels.Distance.COSINE,
                 ),
                 timeout=30,
             )
             break
-        except Exception as e:
-            # Ako i dalje briše, pričekaj pa pokušaj opet
+        except Exception:
             time.sleep(0.25)
     else:
         raise RuntimeError("Could not recreate collection (still deleting?).")
-
-    # (Re)create any payload indexes you use (text/doc_id/hash/etc.)
     ensure_fulltext_index(client, coll, field_name="text")
-    # Ako koristiš dedup: indeksiraj i hash/doc_id/source
     try:
         for field in ("hash", "doc_id", "source"):
             client.create_payload_index(
@@ -392,49 +409,38 @@ def reset_collection() -> str:
                 field_schema=qmodels.PayloadSchemaType.KEYWORD,
             )
     except Exception:
-        pass  # već postoji — ok
-
+        pass
     return coll
-
 
 def _hash_text(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()
 
 def upsert_chunks_to_qdrant(chunks: List[dict], source_name: str) -> int:
-    """
-    OČEKUJE: listu dict-ova {text, page, chunk_idx_on_page}
-    Piše idempotentno: point.id = SHA256(text) (sprječava duplikate).
-    """
     if not chunks:
         return 0
     client, coll, _ = _qdrant()
-    embedder = _embedder()
     BATCH = 128
     uploaded = 0
     now_iso = datetime.utcnow().isoformat() + "Z"
-
-    # osiguraj FT index
     ensure_fulltext_index(client, coll, field_name="text")
-
     for i in range(0, len(chunks), BATCH):
         batch = chunks[i : i + BATCH]
         texts = [b["text"] for b in batch]
-        vecs = embedder.encode(texts, show_progress_bar=False).tolist()
+        vecs = _encode_passages(texts).tolist()
         points = []
         for k, ch in enumerate(batch):
             txt = ch["text"]
-            # deterministički, ali Qdrant-validan ID: UUIDv5 iz sadržaja chunka
             pid_uuid = uuid.uuid5(uuid.NAMESPACE_URL, txt)
             points.append(
                 qmodels.PointStruct(
-                    id=str(pid_uuid),  # ✅ valjan UUID string s crtama
+                    id=str(pid_uuid),
                     vector=vecs[k],
                     payload={
                         "text": txt,
                         "source": source_name,
                         "page": ch.get("page"),
                         "chunk_idx_on_page": ch.get("chunk_idx_on_page"),
-                        "hash": _hash_text(txt),          # zadrži hash u payloadu (za dedup/filtriranje)
+                        "hash": _hash_text(txt),
                         "uploaded_at": now_iso,
                     },
                 )
@@ -442,7 +448,6 @@ def upsert_chunks_to_qdrant(chunks: List[dict], source_name: str) -> int:
         client.upsert(collection_name=coll, points=points, wait=True)
         uploaded += len(points)
     return uploaded
-
 
 def qdrant_count() -> int:
     client, coll, _ = _qdrant()
@@ -452,10 +457,31 @@ def qdrant_count() -> int:
     except Exception:
         return -1
 
-# -------- Context retrieval (semantic + full-text + keyword fallback) --------
+# -------- Context retrieval (semantic + full-text + keyword + bilingual) --------
+ROLE_ALIASES = {
+    "direktor": ["ravnatelj", "predsjednik", "voditelj"],
+    "predsjednik": ["ravnatelj", "direktor", "voditelj"],
+    "ravnatelj": ["direktor", "predsjednik", "voditelj"],
+}
+
+def expand_query_hr(q: str) -> List[str]:
+    ql = q.lower()
+    out = [q]
+    for k, alts in ROLE_ALIASES.items():
+        if k in ql:
+            for a in alts:
+                out.append(re.sub(k, a, q, flags=re.IGNORECASE))
+    # dedup preserving order
+    seen, uniq = set(), []
+    for s in out:
+        if s not in seen:
+            uniq.append(s)
+            seen.add(s)
+    return uniq
+
 def get_qdrant_context_vector(query: str, top_k: int = 10) -> List[Tuple[float, str]]:
     client, coll, _ = _qdrant()
-    qvec = _embedder().encode(query).tolist()
+    qvec = _encode_query(query).tolist()
     hits = client.search(collection_name=coll, query_vector=qvec, limit=top_k)
     if not hits:
         return []
@@ -515,10 +541,6 @@ def search_keyword_in_qdrant(keywords: List[str], max_points: int = 200) -> List
     return uniq
 
 def get_qdrant_context_fulltext(query: str, limit: int = 24) -> List[str]:
-    """
-    Full-text pretraga preko Qdrantovog 'MatchText' nad payload.text.
-    Vraća listu payload tekstova (bez score-a), kasnije ćemo ih re-rankati semantički.
-    """
     client, coll, _ = _qdrant()
     try:
         filt = qmodels.Filter(
@@ -529,7 +551,6 @@ def get_qdrant_context_fulltext(query: str, limit: int = 24) -> List[str]:
                 )
             ]
         )
-        # koristimo scroll da pokupimo više pogodaka; može i .search s filterom + vector
         out: List[str] = []
         next_offset = None
         fetched = 0
@@ -560,12 +581,10 @@ def get_qdrant_context_fulltext(query: str, limit: int = 24) -> List[str]:
 def rerank_by_similarity(query: str, texts: List[str], top_k: int) -> List[Tuple[float, str]]:
     if not texts:
         return []
-    em = _embedder()
-    qv = em.encode(query).tolist()
+    qv = _encode_query(query).tolist()
     scored: List[Tuple[float, str]] = []
-    import math
     for txt in texts:
-        sv = em.encode(txt).tolist()
+        sv = _encode_passage(txt).tolist()
         dot = sum(a*b for a,b in zip(qv, sv))
         nq = math.sqrt(sum(a*a for a in qv)) or 1.0
         ns = math.sqrt(sum(a*a for a in sv)) or 1.0
@@ -576,20 +595,41 @@ def rerank_by_similarity(query: str, texts: List[str], top_k: int) -> List[Tuple
 
 def get_context_smart(query: str, top_k: int = 10, min_vec_score: float = 0.25) -> List[Tuple[float, str]]:
     """
-    1) Semantic vector search
-    2) If weak → FULL-TEXT MatchText nad payload.text + semantički reranking
+    1) Semantic vector search (original + HR synonym expansion + EN translation)
+    2) If weak → FULL-TEXT (HR, EN) + semantički reranking
     3) Ako i dalje prazno → keyword scroll fallback + reranking
     """
-    vec = get_qdrant_context_vector(query, top_k=top_k)
-    if vec and (vec[0][0] >= min_vec_score or len(vec) >= max(4, top_k//2)):
-        return vec
+    lang = safe_detect(query)
 
-    # Full-text
-    ft_hits = get_qdrant_context_fulltext(query, limit=32)
-    if ft_hits:
-        return rerank_by_similarity(query, ft_hits, top_k=top_k)
+    # Build candidate queries
+    queries = [query]
+    if lang in ("hr", "sh", "bs", "sr"):
+        queries = expand_query_hr(query)
+        # add English translation of the primary query
+        try:
+            en_q = _translator_to_en()(query)[0]["translation_text"]
+            queries.append(en_q)
+        except Exception:
+            pass
 
-    # Keyword scroll fallback
+    # 1) Semantic over all candidate queries, then merge by text with max score
+    merged_scores = {}
+    for q in queries:
+        vec = get_qdrant_context_vector(q, top_k=top_k)
+        for s, t in vec:
+            merged_scores[t] = max(merged_scores.get(t, 0.0), s)
+    vec_merged = sorted([(s, t) for t, s in merged_scores.items()], key=lambda x: x[0], reverse=True)[:top_k]
+    if vec_merged and (vec_merged[0][0] >= min_vec_score or len(vec_merged) >= max(4, top_k//2)):
+        return vec_merged
+
+    # 2) Full-text on all candidate queries
+    ft_hits_all: List[str] = []
+    for q in queries:
+        ft_hits_all += get_qdrant_context_fulltext(q, limit=32)
+    if ft_hits_all:
+        return rerank_by_similarity(query, ft_hits_all, top_k=top_k)
+
+    # 3) Keyword fallback on HR tokens from the original query
     kws = _split_keywords(query)
     kw_hits = search_keyword_in_qdrant(kws, max_points=400)
     if kw_hits:
@@ -610,8 +650,8 @@ def build_prompt_with_budget(user_question: str,
                              model_choice: str,
                              reply_tokens: int = 800) -> str:
     ctx_windows = {
-        "HF Pro Models": 8192,
-        "HF Standard Models": 8192,
+        "HF Pro Models (HR-first)": 8192,
+        "HF Standard Models (router)": 8192,
         "DeepSeek R1 (cloud)": 16384,
     }
     max_ctx = ctx_windows.get(model_choice, 8192)
@@ -624,9 +664,7 @@ def build_prompt_with_budget(user_question: str,
         "- Koristi isključivo informacije iz danog konteksta (nema izmišljanja).\n"
         "- Ako kontekst ne sadrži odgovor, reci to izravno (\"Nema dovoljno informacija u dostupnim dokumentima.\").\n"
         "- Odgovaraj isključivo na hrvatskom jeziku, gramatički i stilski prirodno.\n"
-        "- Izbjegavaj meta-komentare, razmišljanja, oznake poput <think> i slično.\n"
-        "- Odgovor formuliraj kao da si stručnjak koji zna objasniti jasno i profesionalno, ali bez suvišne formalnosti.\n"
-        "- Poželjno je da prvi redak odmah sadrži sažeti odgovor, a ako je potrebno, ispod možeš dodati kratko pojašnjenje.\n\n"
+        "- Izbjegavaj meta-komentare i oznake poput <think>.\n\n"
         "📚 KONTEKST:\n"
     )
     footer = f"\n\n❓ PITANJE KORISNIKA:\n{user_question}\n\n💬 ODGOVOR:\n"
@@ -678,66 +716,104 @@ def compose_noinfo_reply(user_question: str) -> str:
     return msg
 
 # -----------------------------
-# LLM backends
+# LLM backends (HR-first router)
 # -----------------------------
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
-from huggingface_hub import InferenceClient
+HR_KEYWORDS = set("""
+da li može možete hrvatski usluga cijena tvrtka poduzeće odgovori sažetak zaključak primjer politika izjava rokovi uvjeti direktor ravnatelj predsjednik
+""".split())
 
-def get_model_response(prompt: str, model_choice: str) -> str:
-    # --- Hugging Face Pro Models ---
-    if model_choice == "HF Pro Models":
+def safe_detect(text: str) -> str:
+    try:
+        return detect(text)
+    except Exception:
+        if re.search(r"[čćšđžČĆŠĐŽ]", text or ""):
+            return "hr"
+        return "en"
+
+def hr_quality_score(s: str) -> float:
+    """Lightweight heuristic for HR-ness and fluency."""
+    if not s:
+        return 0.0
+    s_low = s.lower()
+    diacritics = len(re.findall(r"[čćšđž]", s_low))
+    letters = max(1, len(re.findall(r"[a-zA-Zčćšđž]", s_low)))
+    dia_ratio = diacritics / letters
+    kw_hits = sum(1 for k in HR_KEYWORDS if k in s_low)
+    en_hits = len(re.findall(r"\b(the|and|is|are|you|we|our|with|for|of)\b", s_low))
+    score = 0.5*min(1.0, dia_ratio*4) + 0.4*min(1.0, kw_hits/5) + 0.2*(1.0/(1+en_hits))
+    return min(1.0, score)
+
+def is_low_quality_hr(s: str) -> bool:
+    lang = safe_detect(s)
+    if lang != "hr":
+        if lang in ("sh", "bs", "sr"):
+            return hr_quality_score(s) < 0.35
+        return True
+    return hr_quality_score(s) < 0.30
+
+def get_model_response(prompt: str, model_choice: str, user_lang_guess: str = "hr") -> str:
+    """
+    HR-first router:
+    1) Try multilingual instruct model → HR answer.
+    2) If English-ish/low HR → try a stronger model on the SAME (HR) prompt.
+    3) If still not HR → translate the final ANSWER to HR (do NOT translate prompt/context).
+    """
+    # --- Hugging Face Pro Models (HR-first) ---
+    if model_choice == "HF Pro Models (HR-first)":
         hf_token = os.environ.get("HUGGINGFACE_TOKEN")
         if not hf_token:
             return "Please set HUGGINGFACE_TOKEN environment variable for HF Pro access."
         try:
             client = InferenceClient(token=hf_token)
-            chat_models = ["HuggingFaceTB/SmolLM3-3B"]
-            for model_id in chat_models:
+            # Multilingual chat candidates
+            candidates_primary = [
+                "meta-llama/Meta-Llama-3.1-8B-Instruct",
+                "Qwen/Qwen2.5-7B-Instruct",
+            ]
+            fallback_stronger = [
+                "mistralai/Mixtral-8x7B-Instruct-v0.1",
+            ]
+
+            # Step 1: direct HR attempt(s)
+            for model_id in candidates_primary:
                 try:
-                    messages = [{"role": "user", "content": prompt}]
                     response = client.chat_completion(
-                        messages=messages, model=model_id,
-                        max_tokens=800, temperature=0.7, stream=False
+                        messages=[{"role": "user", "content": prompt}],
+                        model=model_id,
+                        max_tokens=800, temperature=0.5, stream=False
                     )
-                    raw_text = response.choices[0].message.content
-                    return clean_llm_output(raw_text)
+                    txt = clean_llm_output(response.choices[0].message.content)
+                    if not is_low_quality_hr(txt):
+                        return txt
                 except Exception as e:
                     logging.info(f"Chat model {model_id} failed: {e}")
-                    continue
-            text_models = ["gpt2-large","EleutherAI/gpt-neo-2.7B","bigscience/bloom-1b7"]
-            for model_id in text_models:
+
+            # Step 2: stronger model, same prompt (no translation of prompt)
+            for model_id in fallback_stronger:
                 try:
-                    response = client.text_generation(
-                        prompt, model=model_id, max_new_tokens=800,
-                        temperature=0.7, do_sample=True, stream=False, return_full_text=False
+                    response = client.chat_completion(
+                        messages=[{"role": "user", "content": prompt}],
+                        model=model_id,
+                        max_tokens=800, temperature=0.5, stream=False
                     )
-                    result = response.strip() if response else ""
-                    if result and len(result) > 10:
-                        return clean_llm_output(result)
+                    txt2 = clean_llm_output(response.choices[0].message.content)
+                    if not is_low_quality_hr(txt2):
+                        return txt2
+                    # Step 3: translate ANSWER back to HR
+                    to_hr = _translator_to_hr()
+                    return clean_llm_output(to_hr(txt2)[0]["translation_text"])
                 except Exception as e:
-                    logging.info(f"Text model {model_id} failed: {e}")
-                    continue
-            try:
-                response = client.text_generation(
-                    prompt, max_new_tokens=800, temperature=0.7,
-                    do_sample=True, stream=False, return_full_text=False
-                )
-                result = response.strip() if response else ""
-                if result:
-                    return clean_llm_output(result)
-            except Exception as e:
-                logging.info(f"Default model failed: {e}")
+                    logging.info(f"Fallback model {model_id} failed: {e}")
+
+            return "All HF models failed. This might be a temporary API issue."
+
         except Exception as e:
             if "unexpected keyword argument 'provider'" in str(e):
                 return "Please upgrade huggingface_hub: pip install --upgrade huggingface_hub"
             return f"HF Pro error: {e}"
-        return "All HF models failed. This might be a temporary API issue."
 
-    # --- Hugging Face with Third-Party Providers ---
-    if model_choice == "HF Standard Models":
+    # --- Hugging Face with Third-Party Providers (kept, HR-first) ---
+    if model_choice == "HF Standard Models (router)":
         hf_token = os.environ.get("HUGGINGFACE_TOKEN")
         if not hf_token:
             return "HUGGINGFACE_TOKEN environment variable is not set."
@@ -750,33 +826,39 @@ def get_model_response(prompt: str, model_choice: str) -> str:
             for provider, model_id in providers_to_try:
                 try:
                     client = InferenceClient(provider=provider, token=hf_token)
-                    messages = [{"role": "user", "content": prompt}]
                     response = client.chat_completion(
-                        messages=messages, model=model_id,
-                        max_tokens=800, temperature=0.7, stream=False
+                        messages=[{"role": "user", "content": prompt}],
+                        model=model_id, max_tokens=800, temperature=0.6, stream=False
                     )
-                    raw_text = response.choices[0].message.content
-                    return clean_llm_output(raw_text)
+                    txt = clean_llm_output(response.choices[0].message.content)
+                    if not is_low_quality_hr(txt):
+                        return txt
+                    # else fallback to HF direct stronger
+                    break
                 except Exception as e:
                     logging.info(f"Provider {provider} failed: {e}")
                     continue
+
             client = InferenceClient(token=hf_token)
-            basic_models = ["gpt2","distilgpt2","gpt2-medium"]
-            for model_id in basic_models:
+            for model_id in ["mistralai/Mixtral-8x7B-Instruct-v0.1", "meta-llama/Meta-Llama-3.1-8B-Instruct"]:
                 try:
-                    response = client.text_generation(
-                        prompt, model=model_id, max_new_tokens=500,
-                        temperature=0.7, do_sample=True, stream=False, return_full_text=False
+                    response = client.chat_completion(
+                        messages=[{"role": "user", "content": prompt}],
+                        model=model_id, max_tokens=800, temperature=0.6, stream=False
                     )
-                    if response:
-                        return response.strip()
-                except Exception:
-                    continue
+                    txt2 = clean_llm_output(response.choices[0].message.content)
+                    if not is_low_quality_hr(txt2):
+                        return txt2
+                    to_hr = _translator_to_hr()
+                    return clean_llm_output(to_hr(txt2)[0]["translation_text"])
+                except Exception as e:
+                    logging.info(f"HF direct fallback {model_id} failed: {e}")
+            return "All HF standard models failed."
+
         except Exception as e:
             if "unexpected keyword argument 'provider'" in str(e):
                 return "Please upgrade huggingface_hub: pip install --upgrade huggingface_hub"
             return f"HF Standard error: {e}"
-        return "All HF standard models failed."
 
     # --- DeepSeek via OpenRouter ---
     if model_choice == "DeepSeek R1 (cloud)":
@@ -793,11 +875,19 @@ def get_model_response(prompt: str, model_choice: str) -> str:
                 max_tokens=1200,
                 temperature=0.7,
             )
-            raw_text = completion.choices[0].message.content
-            clean_text = clean_llm_output(raw_text)
-            return clean_text
+            txt = clean_llm_output(completion.choices[0].message.content)
+            if user_lang_guess in ("hr", "sh", "bs", "sr") and is_low_quality_hr(txt):
+                to_hr = _translator_to_hr()
+                return clean_llm_output(to_hr(txt)[0]["translation_text"])
+            return txt
         except Exception as e:
             return f"DeepSeek R1 error: {e}"
 
+    # Fallback
+    return "Model route not recognized."
+
+# -----------------------------
+# Run
+# -----------------------------
 if __name__ == "__main__":
     main()
