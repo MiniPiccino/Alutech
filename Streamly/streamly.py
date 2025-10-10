@@ -794,7 +794,7 @@ def get_model_response(prompt: str, model_choice: str, user_lang_guess: str = "h
                     response = client.chat_completion(
                         messages=[{"role": "user", "content": prompt}],
                         model=model_id,
-                        max_tokens=800, temperature=0.5, stream=False
+                        max_tokens=800, temperature=0.1, stream=False
                     )
                     txt2 = clean_llm_output(response.choices[0].message.content)
                     if not is_low_quality_hr(txt2):
