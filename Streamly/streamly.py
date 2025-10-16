@@ -751,14 +751,29 @@ def is_low_quality_hr(s: str) -> bool:
         return True
     return hr_quality_score(s) < 0.30
 
+
+
 def get_model_response(prompt: str, model_choice: str, user_lang_guess: str = "hr") -> str:
     """
-    HR-first router:
+    HR-first router with retry logic:
     1) Try multilingual instruct model → HR answer.
     2) If English-ish/low HR → try a stronger model on the SAME (HR) prompt.
-    3) If still not HR → translate the final ANSWER to HR (do NOT translate prompt/context).
+    3) If still not HR → translate final ANSWER to HR (do NOT translate prompt/context).
     """
-    # --- Hugging Face Pro Models (HR-first) ---
+
+    def try_with_retries(call_fn, retries=3, delay=2):
+        """Helper to retry flaky HF calls."""
+        for attempt in range(1, retries + 1):
+            try:
+                return call_fn()
+            except Exception as e:
+                logging.warning(f"Attempt {attempt}/{retries} failed: {e}")
+                if attempt < retries:
+                    time.sleep(delay)
+                else:
+                    raise
+
+    # --- HF Pro Models (HR-first) ---
     if model_choice == "HF Pro Models (HR-first)":
         hf_token = os.environ.get("HUGGINGFACE_TOKEN")
         if not hf_token:
@@ -777,46 +792,51 @@ def get_model_response(prompt: str, model_choice: str, user_lang_guess: str = "h
             # Step 1: direct HR attempt(s)
             for model_id in candidates_primary:
                 try:
-                    response = client.chat_completion(
-                        messages=[{"role": "user", "content": prompt}],
-                        model=model_id,
-                        max_tokens=800,
-                        temperature=0.5,
-                        stream=False,
-                    )
+                    def call():
+                        resp = client.chat_completion(
+                            messages=[{"role": "user", "content": prompt}],
+                            model=model_id,
+                            max_tokens=800,
+                            temperature=0.5,
+                            stream=False,
+                        )
+                        return resp
+                    response = try_with_retries(call)
                     txt = clean_llm_output(response.choices[0].message.content)
                     if not is_low_quality_hr(txt):
                         return txt
                 except Exception as e:
                     logging.info(f"Chat model {model_id} failed: {e}")
 
-            # Step 2: stronger fallback model
+            # Step 2: stronger model
             for model_id in fallback_stronger:
                 try:
-                    response = client.chat_completion(
-                        messages=[{"role": "user", "content": prompt}],
-                        model=model_id,
-                        max_tokens=800,
-                        temperature=0.1,
-                        stream=False,
-                    )
+                    def call():
+                        resp = client.chat_completion(
+                            messages=[{"role": "user", "content": prompt}],
+                            model=model_id,
+                            max_tokens=800,
+                            temperature=0.1,
+                            stream=False,
+                        )
+                        return resp
+                    response = try_with_retries(call)
                     txt2 = clean_llm_output(response.choices[0].message.content)
                     if not is_low_quality_hr(txt2):
                         return txt2
-                    # Step 3: translate final answer to HR
                     to_hr = _translator_to_hr()
                     return clean_llm_output(to_hr(txt2)[0]["translation_text"])
                 except Exception as e:
                     logging.info(f"Fallback model {model_id} failed: {e}")
 
-            return "All HF models failed. This might be a temporary API issue."
+            return "All HF models failed after retries. This might be a temporary API issue."
 
         except Exception as e:
             if "unexpected keyword argument 'provider'" in str(e):
                 return "Please upgrade huggingface_hub: pip install --upgrade huggingface_hub"
             return f"HF Pro error: {e}"
 
-    # --- Hugging Face with Third-Party Providers (router) ---
+    # --- HF Standard Models (router) ---
     if model_choice == "HF Standard Models (router)":
         hf_token = os.environ.get("HUGGINGFACE_TOKEN")
         if not hf_token:
@@ -832,35 +852,42 @@ def get_model_response(prompt: str, model_choice: str, user_lang_guess: str = "h
             for provider, model_id in providers_to_try:
                 try:
                     client = InferenceClient(provider=provider, token=hf_token)
-                    response = client.chat_completion(
-                        messages=[{"role": "user", "content": prompt}],
-                        model=model_id,
-                        max_tokens=800,
-                        temperature=0.6,
-                        stream=False,
-                    )
+
+                    def call():
+                        return client.chat_completion(
+                            messages=[{"role": "user", "content": prompt}],
+                            model=model_id,
+                            max_tokens=800,
+                            temperature=0.6,
+                            stream=False,
+                        )
+
+                    response = try_with_retries(call)
                     txt = clean_llm_output(response.choices[0].message.content)
                     if not is_low_quality_hr(txt):
                         return txt
-                    break  # try HF fallback below
+                    break
                 except Exception as e:
                     logging.info(f"Provider {provider} failed: {e}")
                     continue
 
-            # HF direct fallback
+            # Direct fallback
             client = InferenceClient(token=hf_token)
             for model_id in [
                 "mistralai/Mixtral-8x7B-Instruct-v0.1",
                 "meta-llama/Meta-Llama-3.1-8B-Instruct",
             ]:
                 try:
-                    response = client.chat_completion(
-                        messages=[{"role": "user", "content": prompt}],
-                        model=model_id,
-                        max_tokens=800,
-                        temperature=0.6,
-                        stream=False,
-                    )
+                    def call():
+                        return client.chat_completion(
+                            messages=[{"role": "user", "content": prompt}],
+                            model=model_id,
+                            max_tokens=800,
+                            temperature=0.6,
+                            stream=False,
+                        )
+
+                    response = try_with_retries(call)
                     txt2 = clean_llm_output(response.choices[0].message.content)
                     if not is_low_quality_hr(txt2):
                         return txt2
@@ -869,7 +896,7 @@ def get_model_response(prompt: str, model_choice: str, user_lang_guess: str = "h
                 except Exception as e:
                     logging.info(f"HF direct fallback {model_id} failed: {e}")
 
-            return "All HF standard models failed."
+            return "All HF standard models failed after retries."
 
         except Exception as e:
             if "unexpected keyword argument 'provider'" in str(e):
@@ -887,12 +914,16 @@ def get_model_response(prompt: str, model_choice: str, user_lang_guess: str = "h
 
         try:
             client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=openrouter_key)
-            completion = client.chat.completions.create(
-                model="deepseek/deepseek-chat-v3.1:free",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=1200,
-                temperature=0.7,
-            )
+
+            def call():
+                return client.chat.completions.create(
+                    model="deepseek/deepseek-chat-v3.1:free",
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=1200,
+                    temperature=0.7,
+                )
+
+            completion = try_with_retries(call)
             txt = clean_llm_output(completion.choices[0].message.content)
 
             if user_lang_guess in ("hr", "sh", "bs", "sr") and is_low_quality_hr(txt):
@@ -905,6 +936,7 @@ def get_model_response(prompt: str, model_choice: str, user_lang_guess: str = "h
 
     # --- Fallback route ---
     return "Model route not recognized."
+
 
 
 # -----------------------------
