@@ -662,7 +662,7 @@ def build_prompt_with_budget(user_question: str,
         "Daj jasan, sažet i točan odgovor koji pokriva bit pitanja tako da korisnik odmah dobije najveću moguću vrijednost.\n\n"
         "📜 PRAVILA:\n"
         "- Koristi isključivo informacije iz danog konteksta (nema izmišljanja).\n"
-        "- Ako kontekst ne sadrži odgovor, reci to izravno (\"Nema dovoljno informacija u dostupnim dokumentima.\").\n"
+        "- Ako kontekst ne sadrži odgovor, reci to izravno (\"Nema dovoljno informacija u dostupnim dokumentima. Provjerite na https://alutech.hr/\").\n"
         "- Odgovaraj isključivo na hrvatskom jeziku, gramatički i stilski prirodno.\n"
         "- Izbjegavaj meta-komentare i oznake poput <think>.\n\n"
         "📚 KONTEKST:\n"
@@ -763,9 +763,9 @@ def get_model_response(prompt: str, model_choice: str, user_lang_guess: str = "h
         hf_token = os.environ.get("HUGGINGFACE_TOKEN")
         if not hf_token:
             return "Please set HUGGINGFACE_TOKEN environment variable for HF Pro access."
+
         try:
             client = InferenceClient(token=hf_token)
-            # Multilingual chat candidates
             candidates_primary = [
                 "meta-llama/Meta-Llama-3.1-8B-Instruct",
                 "Qwen/Qwen2.5-7B-Instruct",
@@ -780,7 +780,9 @@ def get_model_response(prompt: str, model_choice: str, user_lang_guess: str = "h
                     response = client.chat_completion(
                         messages=[{"role": "user", "content": prompt}],
                         model=model_id,
-                        max_tokens=800, temperature=0.5, stream=False
+                        max_tokens=800,
+                        temperature=0.5,
+                        stream=False,
                     )
                     txt = clean_llm_output(response.choices[0].message.content)
                     if not is_low_quality_hr(txt):
@@ -788,18 +790,20 @@ def get_model_response(prompt: str, model_choice: str, user_lang_guess: str = "h
                 except Exception as e:
                     logging.info(f"Chat model {model_id} failed: {e}")
 
-            # Step 2: stronger model, same prompt (no translation of prompt)
+            # Step 2: stronger fallback model
             for model_id in fallback_stronger:
                 try:
                     response = client.chat_completion(
                         messages=[{"role": "user", "content": prompt}],
                         model=model_id,
-                        max_tokens=800, temperature=0.1, stream=False
+                        max_tokens=800,
+                        temperature=0.1,
+                        stream=False,
                     )
                     txt2 = clean_llm_output(response.choices[0].message.content)
                     if not is_low_quality_hr(txt2):
                         return txt2
-                    # Step 3: translate ANSWER back to HR
+                    # Step 3: translate final answer to HR
                     to_hr = _translator_to_hr()
                     return clean_llm_output(to_hr(txt2)[0]["translation_text"])
                 except Exception as e:
@@ -812,39 +816,50 @@ def get_model_response(prompt: str, model_choice: str, user_lang_guess: str = "h
                 return "Please upgrade huggingface_hub: pip install --upgrade huggingface_hub"
             return f"HF Pro error: {e}"
 
-    # --- Hugging Face with Third-Party Providers (kept, HR-first) ---
+    # --- Hugging Face with Third-Party Providers (router) ---
     if model_choice == "HF Standard Models (router)":
         hf_token = os.environ.get("HUGGINGFACE_TOKEN")
         if not hf_token:
             return "HUGGINGFACE_TOKEN environment variable is not set."
+
         try:
             providers_to_try = [
                 ("together", "meta-llama/Llama-3.2-3B-Instruct"),
                 ("fireworks", "accounts/fireworks/models/llama-v3p1-8b-instruct"),
                 ("replicate", "meta/llama-2-7b-chat"),
             ]
+
             for provider, model_id in providers_to_try:
                 try:
                     client = InferenceClient(provider=provider, token=hf_token)
                     response = client.chat_completion(
                         messages=[{"role": "user", "content": prompt}],
-                        model=model_id, max_tokens=800, temperature=0.6, stream=False
+                        model=model_id,
+                        max_tokens=800,
+                        temperature=0.6,
+                        stream=False,
                     )
                     txt = clean_llm_output(response.choices[0].message.content)
                     if not is_low_quality_hr(txt):
                         return txt
-                    # else fallback to HF direct stronger
-                    break
+                    break  # try HF fallback below
                 except Exception as e:
                     logging.info(f"Provider {provider} failed: {e}")
                     continue
 
+            # HF direct fallback
             client = InferenceClient(token=hf_token)
-            for model_id in ["mistralai/Mixtral-8x7B-Instruct-v0.1", "meta-llama/Meta-Llama-3.1-8B-Instruct"]:
+            for model_id in [
+                "mistralai/Mixtral-8x7B-Instruct-v0.1",
+                "meta-llama/Meta-Llama-3.1-8B-Instruct",
+            ]:
                 try:
                     response = client.chat_completion(
                         messages=[{"role": "user", "content": prompt}],
-                        model=model_id, max_tokens=800, temperature=0.6, stream=False
+                        model=model_id,
+                        max_tokens=800,
+                        temperature=0.6,
+                        stream=False,
                     )
                     txt2 = clean_llm_output(response.choices[0].message.content)
                     if not is_low_quality_hr(txt2):
@@ -853,6 +868,7 @@ def get_model_response(prompt: str, model_choice: str, user_lang_guess: str = "h
                     return clean_llm_output(to_hr(txt2)[0]["translation_text"])
                 except Exception as e:
                     logging.info(f"HF direct fallback {model_id} failed: {e}")
+
             return "All HF standard models failed."
 
         except Exception as e:
@@ -864,11 +880,13 @@ def get_model_response(prompt: str, model_choice: str, user_lang_guess: str = "h
     if model_choice == "DeepSeek R1 (cloud)":
         if not OpenAI:
             return "DeepSeek R1 backend unavailable. Please install openai package."
+
         openrouter_key = os.getenv("OPENROUTER_API_KEY")
         if not openrouter_key:
             return "Please set OPENROUTER_API_KEY environment variable."
-        client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=openrouter_key)
+
         try:
+            client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=openrouter_key)
             completion = client.chat.completions.create(
                 model="deepseek/deepseek-chat-v3.1:free",
                 messages=[{"role": "user", "content": prompt}],
@@ -876,15 +894,18 @@ def get_model_response(prompt: str, model_choice: str, user_lang_guess: str = "h
                 temperature=0.7,
             )
             txt = clean_llm_output(completion.choices[0].message.content)
+
             if user_lang_guess in ("hr", "sh", "bs", "sr") and is_low_quality_hr(txt):
                 to_hr = _translator_to_hr()
                 return clean_llm_output(to_hr(txt)[0]["translation_text"])
             return txt
+
         except Exception as e:
             return f"DeepSeek R1 error: {e}"
 
-    # Fallback
+    # --- Fallback route ---
     return "Model route not recognized."
+
 
 # -----------------------------
 # Run
