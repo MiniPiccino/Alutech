@@ -634,6 +634,7 @@ def build_prompt_with_budget(user_question: str,
         "- Ako kontekst ne sadrži odgovor, reci ovo što je u zagradi (\"Nema dovoljno informacija u dostupnim dokumentima. Provjerite na https://alutech.hr/\").\n"
         "- Odgovaraj isključivo na hrvatskom jeziku, gramatički i stilski prirodno.\n"
         "- Ne spominji dokumente.\n"
+        "- Znaj da odgovaraš na pitanja vezana za poduzeće Alutech, te da su druge kompanije sporedne.\n"
         "- Izbjegavaj meta-komentare i oznake poput <think>.\n\n"
         "📚 KONTEKST:\n"
     )
