@@ -89,6 +89,20 @@ COMPANY_LOGO_PATH = COMPANY_MEDIA_DIR / "image.png"  # prilagodite naziv datotek
 PRODUCTION_MODEL_CHOICE = "HF Pro Models (HR-first)"  # uredite po potrebi
 PRODUCTION_PAGE_TITLE = "Alutech Chatbot (Production)"
 
+
+def _get_config_value(key: str, required: bool = False) -> str | None:
+    value = None
+    try:
+        value = st.secrets.get(key)
+    except Exception:
+        # st.secrets might not be initialised yet in bare execution
+        pass
+    if value is None:
+        value = os.getenv(key)
+    if required and not value:
+        raise RuntimeError(f"Configuration value '{key}' is not set. Define it in Streamlit secrets or environment.")
+    return value
+
 # -----------------------------
 # Cached resources
 # -----------------------------
@@ -119,8 +133,8 @@ def _encode_passage(text: str):
 
 # --- REST ping like curl ---
 def _ping_qdrant_rest() -> tuple[bool, str]:
-    url = st.secrets.get("QDRANT_URL")
-    key = st.secrets.get("QDRANT_API_KEY")
+    url = _get_config_value("QDRANT_URL")
+    key = _get_config_value("QDRANT_API_KEY")
     if not url:
         return False, "QDRANT_URL not set."
     try:
@@ -148,10 +162,8 @@ def clean_llm_output(text: str) -> str:
 # Qdrant client & collection
 # -----------------------------
 def _mk_qdrant_client_from_url():
-    raw_url = st.secrets.get("QDRANT_URL")
-    api_key = st.secrets.get("QDRANT_API_KEY")
-    if not raw_url:
-        raise RuntimeError("QDRANT_URL is not set.")
+    raw_url = _get_config_value("QDRANT_URL", required=True)
+    api_key = _get_config_value("QDRANT_API_KEY")
     u = urllib.parse.urlparse(raw_url)
     if u.scheme != "https":
         raise RuntimeError("Qdrant Cloud requires HTTPS URL.")
@@ -166,7 +178,7 @@ def _mk_qdrant_client_from_url():
 
 @st.cache_resource(show_spinner=False)
 def _qdrant() -> Tuple[QdrantClient, str, int]:
-    coll = st.secrets["QDRANT_COLLECTION"]
+    coll = _get_config_value("QDRANT_COLLECTION", required=True)
     client, host, port, ipv4s = _mk_qdrant_client_from_url()
     try:
         client.get_collections()
@@ -241,7 +253,7 @@ def main():
             _qdrant()
             ok_client = True
         except Exception as e:
-            st.error('Povezivanje na Qdrant klijent nije uspjelo.')
+            st.error(f'Povezivanje na Qdrant klijent nije uspjelo: {e}')
             logging.error('Qdrant client init failed: %s', e)
 
     if not ok_rest or not ok_client:
