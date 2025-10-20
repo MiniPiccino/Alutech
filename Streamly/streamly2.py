@@ -261,26 +261,8 @@ def main():
 
     model_choice = PRODUCTION_MODEL_CHOICE
 
-    st.subheader('1) Učitajte dokumente')
-    uploaded_files = st.file_uploader(
-        'Dodajte PDF ili TXT datoteke',
-        type=['pdf', 'txt'],
-        accept_multiple_files=True,
-    )
-    if uploaded_files:
-        with st.spinner('Obrada i spremanje u Qdrant...'):
-            total_chunks = 0
-            for f in uploaded_files:
-                pages = extract_text_from_upload(f)
-                chunk_size = 1000
-                chunk_overlap = 200
-                chunks = make_chunks_from_pages(pages, size=chunk_size, overlap=chunk_overlap)
-                st.write(f"{f.name}: {len(chunks)} segmenata (size={chunk_size}, overlap={chunk_overlap})")
-                n = upsert_chunks_to_qdrant(chunks, source_name=f.name)
-                total_chunks += n
-            st.success(f'Uspješno spremljeno: {total_chunks} segmenata.')
-
-    st.subheader('2) Chat')
+    st.subheader('Chat')
+    st.caption('Dokumenti su unaprijed učitani u sustav. Postavite pitanje i dobit ćete sažet odgovor.')
     if 'history' not in st.session_state:
         st.session_state.history = []
 
