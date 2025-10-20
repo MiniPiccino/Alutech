@@ -562,6 +562,34 @@ def rerank_by_similarity(query: str, texts: List[str], top_k: int) -> List[Tuple
     scored.sort(key=lambda x: x[0], reverse=True)
     return scored[:top_k]
 
+
+def _prioritize_company_contexts(query: str, contexts: List[Tuple[float, str]]) -> List[Tuple[float, str]]:
+    if not contexts:
+        return contexts
+    q_low = (query or "").lower()
+    if any(term in q_low for term in ALUTECH_TERMS):
+        hits = []
+        for item in contexts:
+            text_low = item[1].lower()
+            if any(term in text_low for term in ALUTECH_TERMS):
+                hits.append(item)
+        if hits:
+            return hits
+    return contexts
+
+def _default_to_company_contexts(query: str, contexts: List[Tuple[float, str]], top_k: int) -> List[Tuple[float, str]]:
+    if contexts and any(term in item[1].lower() for item in contexts for term in ALUTECH_TERMS):
+        return contexts
+    q_low = (query or "").lower()
+    if any(term in q_low for term in ALUTECH_TERMS):
+        return contexts
+    uppercase_tokens = [tok for tok in re.findall(r"\b[0-9A-ZČĆŽŠĐ]{2,}\b", query or "") if tok.upper() == tok]
+    if any(tok.lower() not in {"alutech", "alu", "alu-tech"} for tok in uppercase_tokens):
+        return contexts
+    fallback = get_qdrant_context_vector("Alutech", top_k=top_k)
+    fallback = _prioritize_company_contexts("Alutech", fallback)
+    return fallback if fallback else contexts
+
 def get_context_smart(query: str, top_k: int = 10, min_vec_score: float = 0.25) -> List[Tuple[float, str]]:
     """
     1) Semantic vector search (original + HR synonym expansion + EN translation)
@@ -588,23 +616,27 @@ def get_context_smart(query: str, top_k: int = 10, min_vec_score: float = 0.25) 
         for s, t in vec:
             merged_scores[t] = max(merged_scores.get(t, 0.0), s)
     vec_merged = sorted([(s, t) for t, s in merged_scores.items()], key=lambda x: x[0], reverse=True)[:top_k]
+    vec_merged = _prioritize_company_contexts(query, vec_merged)
     if vec_merged and (vec_merged[0][0] >= min_vec_score or len(vec_merged) >= max(4, top_k//2)):
-        return vec_merged
+        return _default_to_company_contexts(query, vec_merged, top_k)
 
     # 2) Full-text on all candidate queries
     ft_hits_all: List[str] = []
     for q in queries:
         ft_hits_all += get_qdrant_context_fulltext(q, limit=32)
     if ft_hits_all:
-        return rerank_by_similarity(query, ft_hits_all, top_k=top_k)
+        ft_ranked = rerank_by_similarity(query, ft_hits_all, top_k=top_k)
+        return _default_to_company_contexts(query, _prioritize_company_contexts(query, ft_ranked), top_k)
 
     # 3) Keyword fallback on HR tokens from the original query
     kws = _split_keywords(query)
     kw_hits = search_keyword_in_qdrant(kws, max_points=400)
     if kw_hits:
-        return rerank_by_similarity(query, kw_hits, top_k=top_k)
+        kw_ranked = rerank_by_similarity(query, kw_hits, top_k=top_k)
+        return _default_to_company_contexts(query, _prioritize_company_contexts(query, kw_ranked), top_k)
 
-    return []
+    fallback = _default_to_company_contexts(query, [], top_k)
+    return fallback if fallback else []
 
 # -----------------------------
 # Prompt building with token budgeting
@@ -691,8 +723,11 @@ def compose_noinfo_reply(user_question: str) -> str:
 # LLM backends (HR-first router)
 # -----------------------------
 HR_KEYWORDS = set("""
+
 da li može možete hrvatski usluga cijena tvrtka poduzeće odgovori sažetak zaključak primjer politika izjava rokovi uvjeti direktor ravnatelj predsjednik
 """.split())
+
+ALUTECH_TERMS = ('alutech', 'alu tech', 'alu-tech')
 
 SR_LATIN_MARKERS = {
     "tačnije", "tačno", "tačan", "tačna", "tačne", "tačnosti",
