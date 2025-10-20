@@ -34,6 +34,7 @@ import math
 import time
 import socket
 import urllib.parse
+from pathlib import Path
 
 import streamlit as st
 from dotenv import load_dotenv, find_dotenv
@@ -80,6 +81,36 @@ def _apply_proxy_bypass():
         if val and ("localhost" in val or "127.0.0.1" in val):
             os.environ.pop(var, None)
 _apply_proxy_bypass()
+
+BASE_DIR = Path(__file__).resolve().parent
+COMPANY_MEDIA_DIR = BASE_DIR / "company_media"
+COMPANY_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+
+
+def _get_latest_company_photo() -> Path | None:
+    try:
+        images = [
+            p for p in COMPANY_MEDIA_DIR.iterdir()
+            if p.is_file() and p.suffix.lower() in _IMAGE_EXTENSIONS
+        ]
+    except FileNotFoundError:
+        return None
+    if not images:
+        return None
+    images.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return images[0]
+
+
+def _persist_company_photo(uploaded_file) -> Path:
+    timestamp = int(time.time())
+    original_name = Path(uploaded_file.name).stem
+    sanitized_name = re.sub(r"[^a-zA-Z0-9_-]+", "-", original_name).strip("-") or "company-photo"
+    suffix = Path(uploaded_file.name).suffix.lower()
+    dest = COMPANY_MEDIA_DIR / f"{sanitized_name}-{timestamp}{suffix}"
+    dest.write_bytes(uploaded_file.getbuffer())
+    return dest
 
 # -----------------------------
 # Cached resources
@@ -212,8 +243,38 @@ def main():
     st.title("Document Chatbot (Qdrant)")
     st.caption("Upload PDF/TXT. We embed, store in Qdrant Cloud, and chat over your docs. (HR-first)")
 
-    MODEL_OPTIONS = ["HF Pro Models (HR-first)", "HF Standard Models (router)", "DeepSeek R1 (cloud)"]
+    MODEL_OPTIONS = ["HF Pro Models", "HF Standard Models", "DeepSeek R1"]
     with st.sidebar:
+        image_slot = st.empty()
+        logo_path: Path | None = None
+        session_logo = st.session_state.get("company_photo_path")
+        if session_logo:
+            candidate = Path(session_logo)
+            if candidate.exists():
+                logo_path = candidate
+            else:
+                st.session_state.pop("company_photo_path", None)
+        if logo_path is None:
+            latest = _get_latest_company_photo()
+            if latest and latest.exists():
+                logo_path = latest
+                st.session_state["company_photo_path"] = str(latest)
+        if logo_path and logo_path.exists():
+            image_slot.image(str(logo_path), use_column_width=True)
+            st.caption("Fotografija tvrtke")
+
+        uploaded_logo = st.file_uploader(
+            "Učitaj fotografiju tvrtke",
+            type=["png", "jpg", "jpeg", "webp", "gif"],
+            key="company_photo_uploader"
+        )
+        if uploaded_logo is not None:
+            saved_path = _persist_company_photo(uploaded_logo)
+            st.session_state["company_photo_path"] = str(saved_path)
+            image_slot.image(str(saved_path), use_column_width=True)
+            st.success("Nova fotografija spremljena u mapi 'company_media'.")
+
+        st.divider()
         selected_model = st.selectbox("Select model", MODEL_OPTIONS, index=0)
         st.divider()
         st.subheader("Vector DB")
