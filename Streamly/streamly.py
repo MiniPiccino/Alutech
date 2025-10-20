@@ -134,7 +134,7 @@ def clean_llm_output(text: str) -> str:
     s = re.sub(r"(?im)^\s*(Thought|Thinking|Analysis|Reasoning)\s*:\s.*?$", "", s)
     s = re.sub(r"(?is)<\s*reflection[^>]*>.*?<\s*/\s*reflection\s*>", "", s)
     s = re.sub(r"\n{3,}", "\n\n", s).strip()
-    return s
+    return _normalize_to_hr(s)
 
 # -----------------------------
 # Qdrant client & collection
@@ -723,6 +723,57 @@ HR_KEYWORDS = set("""
 da li može možete hrvatski usluga cijena tvrtka poduzeće odgovori sažetak zaključak primjer politika izjava rokovi uvjeti direktor ravnatelj predsjednik
 """.split())
 
+SR_LATIN_MARKERS = {
+    "tačnije", "tačno", "tačan", "tačna", "tačne", "tačnosti",
+    "preduzeće", "preduzeća", "preduzeću", "preduzećima",
+    "preduzetnik", "preduzetnici", "preduzetništvo",
+    "opština", "opštine", "opštinski",
+    "svetski", "svetska", "svetsko",
+}
+
+_SR_TO_HR_MAP = {
+    "tačnije": "točnije",
+    "tačno": "točno",
+    "tačan": "točan",
+    "tačna": "točna",
+    "tačne": "točne",
+    "tačnosti": "točnosti",
+    "preduzeće": "poduzeće",
+    "preduzeća": "poduzeća",
+    "preduzeću": "poduzeću",
+    "preduzećima": "poduzećima",
+    "preduzetnik": "poduzetnik",
+    "preduzetnici": "poduzetnici",
+    "preduzetništvo": "poduzetništvo",
+    "opština": "općina",
+    "opštine": "općine",
+    "opštinski": "općinski",
+    "svetski": "svjetski",
+    "svetska": "svjetska",
+    "svetsko": "svjetsko",
+}
+
+_SR_PATTERN = re.compile(r"\b(" + "|".join(re.escape(k) for k in _SR_TO_HR_MAP.keys()) + r")\b", flags=re.IGNORECASE)
+
+
+def _normalize_to_hr(text: str) -> str:
+    if not text:
+        return ""
+
+    def repl(match: re.Match) -> str:
+        original = match.group(0)
+        target = _SR_TO_HR_MAP.get(original.lower())
+        if not target:
+            return original
+        if original.isupper():
+            return target.upper()
+        if original[0].isupper():
+            return target.capitalize()
+        return target
+
+    return _SR_PATTERN.sub(repl, text)
+
+
 def safe_detect(text: str) -> str:
     try:
         return detect(text)
@@ -742,7 +793,9 @@ def hr_quality_score(s: str) -> float:
     kw_hits = sum(1 for k in HR_KEYWORDS if k in s_low)
     en_hits = len(re.findall(r"\b(the|and|is|are|you|we|our|with|for|of)\b", s_low))
     score = 0.5*min(1.0, dia_ratio*4) + 0.4*min(1.0, kw_hits/5) + 0.2*(1.0/(1+en_hits))
-    return min(1.0, score)
+    sr_hits = sum(1 for marker in SR_LATIN_MARKERS if marker in s_low)
+    score -= 0.4*min(1.0, sr_hits/2)
+    return max(0.0, min(1.0, score))
 
 def is_low_quality_hr(s: str) -> bool:
     lang = safe_detect(s)
