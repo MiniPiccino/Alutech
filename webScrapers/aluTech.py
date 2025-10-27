@@ -42,6 +42,21 @@ def is_same_domain(start_url, candidate_url):
     c = tldextract.extract(candidate_url)
     return (s.domain == c.domain and s.suffix == c.suffix)
 
+def is_under_start_path(start_url, candidate_url):
+    start = urllib.parse.urlparse(start_url)
+    candidate = urllib.parse.urlparse(candidate_url)
+
+    if start.netloc != candidate.netloc:
+        return False
+
+    start_path = start.path.rstrip('/')
+    if not start_path:
+        # When crawling from the domain root keep existing breadth
+        return True
+
+    candidate_path = candidate.path.rstrip('/')
+    return candidate_path.startswith(start_path)
+
 def get_robots_parser(start_url):
     parsed = urllib.parse.urlparse(start_url)
     robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
@@ -69,7 +84,17 @@ def extract_visible_text(soup):
     # Remove script/style/navigation/footer/hidden elements
     for tag in soup(['script', 'style', 'nav', 'footer', 'header', 'noscript', 'svg', 'iframe']):
         tag.decompose()
-    text = soup.get_text(separator='\n', strip=True)
+
+    target = None
+    for selector in ('div.post-content', 'div.entry-content', 'main'):
+        candidate = soup.select_one(selector)
+        if candidate and candidate.get_text(strip=True):
+            target = candidate
+            break
+    if target is None:
+        target = soup.body or soup
+
+    text = target.get_text(separator='\n', strip=True)
     # Collapse multiple blank lines
     text = re.sub(r'\n\s*\n+', '\n\n', text)
     return text
@@ -187,8 +212,13 @@ def scrape(start_url, output_file, max_pages=200, max_depth=3, delay_between_req
 
             if depth < max_depth:
                 for link in extract_links(soup, url):
-                    if link not in visited and is_same_domain(start_url, link):
-                        q.append((link, depth + 1))
+                    if link in visited:
+                        continue
+                    if not is_same_domain(start_url, link):
+                        continue
+                    if not (is_under_start_path(start_url, link) or depth == 0):
+                        continue
+                    q.append((link, depth + 1))
 
         except requests.RequestException as e:
             print(f"[error] {url} -> {e}")

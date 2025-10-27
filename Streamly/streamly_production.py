@@ -230,7 +230,6 @@ def ensure_fulltext_index(client: QdrantClient, coll: str, field_name: str = "te
 def main():
     st.set_page_config(page_title=PRODUCTION_PAGE_TITLE, page_icon='📄', layout='wide')
     st.title('Alutech Chatbot')
-    st.caption('Profesionalni pregled vaših dokumenata i odgovori na hrvatskom jeziku.')
 
     ok_rest = False
     ok_client = False
@@ -262,7 +261,6 @@ def main():
     model_choice = PRODUCTION_MODEL_CHOICE
 
     st.subheader('Chat')
-    st.caption('Dokumenti su unaprijed učitani u sustav. Postavite pitanje i dobit ćete sažet odgovor.')
     if 'history' not in st.session_state:
         st.session_state.history = []
 
