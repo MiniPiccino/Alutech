@@ -27,7 +27,7 @@ import os
 import uuid
 import logging
 from datetime import datetime
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 import re
 import hashlib
 import math
@@ -266,13 +266,47 @@ def main():
 
     user_msg = st.chat_input('Postavite pitanje o učitanim dokumentima…')
     if user_msg:
+        user_lang_guess = safe_detect(user_msg)
         contexts = get_context_smart(user_msg, top_k=10, min_vec_score=0.25)
         if not contexts:
             reply = compose_noinfo_reply(user_msg)
         else:
             prompt = build_prompt_with_budget(user_msg, contexts, model_choice, reply_tokens=800)
-            reply = get_model_response(prompt, model_choice, user_lang_guess=safe_detect(user_msg))
-            reply = clean_llm_output(reply)
+            primary_raw = get_model_response(prompt, model_choice, user_lang_guess=user_lang_guess)
+            reply = clean_llm_output(primary_raw)
+
+            if is_backend_failure_message(reply):
+                logging.warning("Primary model %s failed: %s", model_choice, reply)
+                failure_notes = [f"{model_choice}: {reply}"]
+                fallback_applied = False
+                fallback_candidates: List[str] = []
+
+                if model_choice == "HF Pro Models (HR-first)":
+                    fallback_candidates.extend([
+                        "HF Standard Models (router)",
+                        "DeepSeek R1 (cloud)",
+                    ])
+                elif model_choice == "HF Standard Models (router)":
+                    fallback_candidates.append("DeepSeek R1 (cloud)")
+
+                for alt_choice in fallback_candidates:
+                    alt_raw = get_model_response(prompt, alt_choice, user_lang_guess=user_lang_guess)
+                    alt_reply = clean_llm_output(alt_raw)
+                    if not is_backend_failure_message(alt_reply):
+                        reply = alt_reply
+                        fallback_applied = True
+                        logging.info("Fallback to %s succeeded", alt_choice)
+                        break
+                    failure_notes.append(f"{alt_choice}: {alt_reply}")
+                    logging.warning("Fallback model %s failed: %s", alt_choice, alt_reply)
+
+                if not fallback_applied:
+                    failure_summary = summarize_backend_failure("; ".join(failure_notes))
+                    reply = compose_noinfo_reply(user_msg)
+                    reply += (
+                        "\n\nUpozorenje: LLM backend trenutno nije dostupan "
+                        f"({failure_summary}). Pokusajte ponovno kasnije ili provjerite API postavke."
+                    )
 
         st.session_state.history.append({'role': 'user', 'content': user_msg})
         st.session_state.history.append({'role': 'assistant', 'content': reply})
@@ -808,6 +842,37 @@ def is_low_quality_hr(s: str) -> bool:
             return hr_quality_score(s) < 0.35
         return True
     return hr_quality_score(s) < 0.30
+
+
+def is_backend_failure_message(msg: Optional[str]) -> bool:
+    if not msg:
+        return True
+    lowered = msg.strip().lower()
+    if not lowered:
+        return True
+    failure_markers = (
+        "all hf models failed",
+        "hf pro error",
+        "hf standard error",
+        "deepseek r1 error",
+        "backend unavailable",
+        "unexpected keyword argument 'provider'",
+        "please set huggingface_token",
+        "please set openrouter_api_key",
+        "model route not implemented",
+    )
+    if any(marker in lowered for marker in failure_markers):
+        return True
+    return False
+
+
+def summarize_backend_failure(msg: Optional[str]) -> str:
+    if not msg:
+        return "bez detalja"
+    first_line = msg.strip().splitlines()[0]
+    if len(first_line) > 160:
+        first_line = first_line[:157] + "..."
+    return first_line or "bez detalja"
 
 
 
