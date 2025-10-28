@@ -1085,7 +1085,7 @@ def get_model_response(prompt: str, model_choice: str, user_lang_guess: str = "h
             return f"DeepSeek R1 error: {e}"
 
     # --- Fallback route ---
-    return "Model route not recognized."
+    return "Model route not implemented."
 
 
 
