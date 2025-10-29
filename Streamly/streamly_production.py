@@ -88,7 +88,8 @@ COMPANY_MEDIA_DIR = BASE_DIR / "company_media"
 COMPANY_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 COMPANY_LOGO_PATH = COMPANY_MEDIA_DIR / "image.png"  # prilagodite naziv datoteke po potrebi
 OPENAI_PRIMARY_CHAT_MODEL = "gpt-4o-mini"
-PRODUCTION_MODEL_CHOICE = "OpenAI GPT-4o-mini (primary)"  # uredite po potrebi
+OPENAI_PRIMARY_LABEL = "OpenAI GPT-4o-mini (primary)"
+PRODUCTION_MODEL_CHOICE = OPENAI_PRIMARY_LABEL  # uredite po potrebi
 PRODUCTION_PAGE_TITLE = "Alutech Chatbot (Production)"
 
 
@@ -291,7 +292,7 @@ def main():
                 fallback_applied = False
                 fallback_candidates: List[str] = []
 
-                if model_choice == "OpenAI GPT-4o (primary)":
+                if model_choice == OPENAI_PRIMARY_LABEL:
                     fallback_candidates.extend([
                         "HF Pro Models (HR-first)",
                         "HF Standard Models (router)",
@@ -701,7 +702,7 @@ def build_prompt_with_budget(user_question: str,
                              model_choice: str,
                              reply_tokens: int = 800) -> str:
     ctx_windows = {
-        "OpenAI GPT-4o (primary)": 128000,
+        OPENAI_PRIMARY_LABEL: 128000,
         "HF Pro Models (HR-first)": 8192,
         "HF Standard Models (router)": 8192,
         "DeepSeek R1 (cloud)": 16384,
@@ -916,7 +917,7 @@ def get_model_response(prompt: str, model_choice: str, user_lang_guess: str = "h
                     raise
 
     # --- OpenAI primary route ---
-    if model_choice == "OpenAI GPT-4o (primary)":
+    if model_choice == OPENAI_PRIMARY_LABEL:
         if not OpenAI:
             return "OpenAI backend unavailable. Please install the openai package."
 
@@ -945,7 +946,7 @@ def get_model_response(prompt: str, model_choice: str, user_lang_guess: str = "h
             return txt
 
         except Exception as e:
-            return f"OpenAI GPT-4o error: {e}"
+            return f"{model_choice} error: {e}"
 
     # --- HF Pro Models (HR-first) ---
     if model_choice == "HF Pro Models (HR-first)":
