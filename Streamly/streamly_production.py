@@ -18,6 +18,7 @@ Environment/Secrets (Streamlit):
 - st.secrets["QDRANT_URL"] (https://<cluster>.<region>.qdrant.tech:443)
 - st.secrets["QDRANT_API_KEY"]
 - st.secrets["QDRANT_COLLECTION"]
+- st.secrets["OPENAI_API_KEY"]
 - env HUGGINGFACE_TOKEN (for HF Inference)
 - env OPENROUTER_API_KEY (optional, for DeepSeek route)
 """
@@ -86,7 +87,8 @@ BASE_DIR = Path(__file__).resolve().parent
 COMPANY_MEDIA_DIR = BASE_DIR / "company_media"
 COMPANY_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 COMPANY_LOGO_PATH = COMPANY_MEDIA_DIR / "image.png"  # prilagodite naziv datoteke po potrebi
-PRODUCTION_MODEL_CHOICE = "HF Pro Models (HR-first)"  # uredite po potrebi
+OPENAI_PRIMARY_CHAT_MODEL = "gpt-4o-mini"
+PRODUCTION_MODEL_CHOICE = "OpenAI GPT-4o (primary)"  # uredite po potrebi
 PRODUCTION_PAGE_TITLE = "Alutech Chatbot (Production)"
 
 
@@ -281,7 +283,13 @@ def main():
                 fallback_applied = False
                 fallback_candidates: List[str] = []
 
-                if model_choice == "HF Pro Models (HR-first)":
+                if model_choice == "OpenAI gpt-4o-mini (primary)":
+                    fallback_candidates.extend([
+                        "HF Pro Models (HR-first)",
+                        "HF Standard Models (router)",
+                        "DeepSeek R1 (cloud)",
+                    ])
+                elif model_choice == "HF Pro Models (HR-first)":
                     fallback_candidates.extend([
                         "HF Standard Models (router)",
                         "DeepSeek R1 (cloud)",
@@ -895,6 +903,37 @@ def get_model_response(prompt: str, model_choice: str, user_lang_guess: str = "h
                     time.sleep(delay)
                 else:
                     raise
+
+    # --- OpenAI primary route ---
+    if model_choice == "OpenAI GPT-4o (primary)":
+        if not OpenAI:
+            return "OpenAI backend unavailable. Please install the openai package."
+
+        openai_key = _get_config_value("OPENAI_API_KEY")
+        if not openai_key:
+            return "OPENAI_API_KEY is not configured. Add it to Streamlit secrets or the environment."
+
+        try:
+            client = OpenAI(api_key=openai_key)
+
+            def call():
+                return client.chat.completions.create(
+                    model=OPENAI_PRIMARY_CHAT_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=800,
+                    temperature=0.6,
+                )
+
+            completion = try_with_retries(call)
+            txt = clean_llm_output(completion.choices[0].message.content)
+
+            if user_lang_guess in ("hr", "sh", "bs", "sr") and is_low_quality_hr(txt):
+                to_hr = _translator_to_hr()
+                return clean_llm_output(to_hr(txt)[0]["translation_text"])
+            return txt
+
+        except Exception as e:
+            return f"OpenAI GPT-4o error: {e}"
 
     # --- HF Pro Models (HR-first) ---
     if model_choice == "HF Pro Models (HR-first)":
