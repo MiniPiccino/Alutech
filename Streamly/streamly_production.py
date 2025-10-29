@@ -118,11 +118,19 @@ def _add_e5_prefix(s: str, kind: str) -> str:
 
 @st.cache_resource(show_spinner=False)
 def _translator_to_en():
-    return pipeline("translation", model="Helsinki-NLP/opus-mt-hr-en", device_map="auto")
+    try:
+        return pipeline("translation", model="Helsinki-NLP/opus-mt-hr-en", device_map="auto")
+    except Exception as exc:
+        logging.warning("Translator HR->EN unavailable: %s", exc)
+        return None
 
 @st.cache_resource(show_spinner=False)
 def _translator_to_hr():
-    return pipeline("translation", model="Helsinki-NLP/opus-mt-en-hr", device_map="auto")
+    try:
+        return pipeline("translation", model="Helsinki-NLP/opus-mt-en-hr", device_map="auto")
+    except Exception as exc:
+        logging.warning("Translator EN->HR unavailable: %s", exc)
+        return None
 
 def _encode_query(text: str):
     return _embedder().encode(_add_e5_prefix(text, "query"), show_progress_bar=False)
@@ -644,8 +652,10 @@ def get_context_smart(query: str, top_k: int = 10, min_vec_score: float = 0.25) 
         queries = expand_query_hr(query)
         # add English translation of the primary query
         try:
-            en_q = _translator_to_en()(query)[0]["translation_text"]
-            queries.append(en_q)
+            to_en = _translator_to_en()
+            if to_en:
+                en_q = to_en(query)[0]["translation_text"]
+                queries.append(en_q)
         except Exception:
             pass
 
@@ -929,7 +939,8 @@ def get_model_response(prompt: str, model_choice: str, user_lang_guess: str = "h
 
             if user_lang_guess in ("hr", "sh", "bs", "sr") and is_low_quality_hr(txt):
                 to_hr = _translator_to_hr()
-                return clean_llm_output(to_hr(txt)[0]["translation_text"])
+                if to_hr:
+                    return clean_llm_output(to_hr(txt)[0]["translation_text"])
             return txt
 
         except Exception as e:
@@ -987,7 +998,9 @@ def get_model_response(prompt: str, model_choice: str, user_lang_guess: str = "h
                     if not is_low_quality_hr(txt2):
                         return txt2
                     to_hr = _translator_to_hr()
-                    return clean_llm_output(to_hr(txt2)[0]["translation_text"])
+                    if to_hr:
+                        return clean_llm_output(to_hr(txt2)[0]["translation_text"])
+                    return txt2
                 except Exception as e:
                     logging.info(f"Fallback model {model_id} failed: {e}")
 
@@ -1054,7 +1067,9 @@ def get_model_response(prompt: str, model_choice: str, user_lang_guess: str = "h
                     if not is_low_quality_hr(txt2):
                         return txt2
                     to_hr = _translator_to_hr()
-                    return clean_llm_output(to_hr(txt2)[0]["translation_text"])
+                    if to_hr:
+                        return clean_llm_output(to_hr(txt2)[0]["translation_text"])
+                    return txt2
                 except Exception as e:
                     logging.info(f"HF direct fallback {model_id} failed: {e}")
 
@@ -1090,7 +1105,8 @@ def get_model_response(prompt: str, model_choice: str, user_lang_guess: str = "h
 
             if user_lang_guess in ("hr", "sh", "bs", "sr") and is_low_quality_hr(txt):
                 to_hr = _translator_to_hr()
-                return clean_llm_output(to_hr(txt)[0]["translation_text"])
+                if to_hr:
+                    return clean_llm_output(to_hr(txt)[0]["translation_text"])
             return txt
 
         except Exception as e:
