@@ -88,7 +88,7 @@ COMPANY_MEDIA_DIR = BASE_DIR / "company_media"
 COMPANY_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 COMPANY_LOGO_PATH = COMPANY_MEDIA_DIR / "image.png"  # prilagodite naziv datoteke po potrebi
 OPENAI_PRIMARY_CHAT_MODEL = "gpt-4o-mini"
-PRODUCTION_MODEL_CHOICE = "OpenAI GPT-4o (primary)"  # uredite po potrebi
+PRODUCTION_MODEL_CHOICE = "OpenAI GPT-4o-mini (primary)"  # uredite po potrebi
 PRODUCTION_PAGE_TITLE = "Alutech Chatbot (Production)"
 
 
@@ -291,7 +291,7 @@ def main():
                 fallback_applied = False
                 fallback_candidates: List[str] = []
 
-                if model_choice == "OpenAI gpt-4o-mini (primary)":
+                if model_choice == "OpenAI GPT-4o (primary)":
                     fallback_candidates.extend([
                         "HF Pro Models (HR-first)",
                         "HF Standard Models (router)",
@@ -701,6 +701,7 @@ def build_prompt_with_budget(user_question: str,
                              model_choice: str,
                              reply_tokens: int = 800) -> str:
     ctx_windows = {
+        "OpenAI GPT-4o (primary)": 128000,
         "HF Pro Models (HR-first)": 8192,
         "HF Standard Models (router)": 8192,
         "DeepSeek R1 (cloud)": 16384,
