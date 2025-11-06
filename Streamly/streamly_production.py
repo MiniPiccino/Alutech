@@ -277,14 +277,25 @@ def main():
 
     user_msg = st.chat_input('Postavite pitanje o učitanim dokumentima…')
     if user_msg:
+        # --- NORMALIZACIJA + HISTORY ---
+        if 'last_company' not in st.session_state:
+            st.session_state.last_company = None
+        normalized_q, current_company = normalize_question(user_msg, st.session_state.last_company)
+        st.session_state.last_company = current_company
+
         user_lang_guess = safe_detect(user_msg)
-        contexts = get_context_smart(user_msg, top_k=10, min_vec_score=0.25)
+
+        # --- RETRIEVAL NA NORMALIZIRANO PITANJE ---
+        contexts = get_context_smart(normalized_q, top_k=10, min_vec_score=0.25)
+
         if not contexts:
-            reply = compose_noinfo_reply(user_msg)
+            reply = compose_noinfo_reply(normalized_q)
         else:
-            prompt = build_prompt_with_budget(user_msg, contexts, model_choice, reply_tokens=800)
+            # --- PROMPT NA NORMALIZIRANO PITANJE ---
+            prompt = build_prompt_with_budget(normalized_q, contexts, model_choice, reply_tokens=800)
             primary_raw = get_model_response(prompt, model_choice, user_lang_guess=user_lang_guess)
             reply = clean_llm_output(primary_raw)
+
 
             if is_backend_failure_message(reply):
                 logging.warning("Primary model %s failed: %s", model_choice, reply)
@@ -627,17 +638,24 @@ def _prioritize_company_contexts(query: str, contexts: List[Tuple[float, str]]) 
     return contexts
 
 def _default_to_company_contexts(query: str, contexts: List[Tuple[float, str]], top_k: int) -> List[Tuple[float, str]]:
+    # Ako već imamo kontekste gdje se pojavljuje "alutech", zadrži
     if contexts and any(term in item[1].lower() for item in contexts for term in ALUTECH_TERMS):
         return contexts
+
     q_low = (query or "").lower()
+    # Ako u upitu eksplicitno stoji alutech, zadrži postojeće
     if any(term in q_low for term in ALUTECH_TERMS):
         return contexts
-    uppercase_tokens = [tok for tok in re.findall(r"\b[0-9A-ZČĆŽŠĐ]{2,}\b", query or "") if tok.upper() == tok]
-    if any(tok.lower() not in {"alutech", "alu", "alu-tech"} for tok in uppercase_tokens):
-        return contexts
-    fallback = get_qdrant_context_vector("Alutech", top_k=top_k)
-    fallback = _prioritize_company_contexts("Alutech", fallback)
-    return fallback if fallback else contexts
+
+    # Inače – preferiraj direktan fallback na Ricat (jer je to default tvog sustava)
+    ricat_fallback = get_qdrant_context_vector("Ricat", top_k=top_k)
+    if ricat_fallback:
+        return ricat_fallback
+
+    # Kao sekundarni fallback, može i "Alutech" (rijetko će trebati)
+    alutech_fallback = get_qdrant_context_vector("Alutech", top_k=top_k)
+    return alutech_fallback if alutech_fallback else contexts
+
 
 def get_context_smart(query: str, top_k: int = 10, min_vec_score: float = 0.25) -> List[Tuple[float, str]]:
     """
@@ -857,6 +875,33 @@ def safe_detect(text: str) -> str:
         if re.search(r"[čćšđžČĆŠĐŽ]", text or ""):
             return "hr"
         return "en"
+
+def normalize_question(user_question: str, last_company: str | None = None):
+    """
+    - Alutech (bilo koji oblik) -> Ricat
+    - Ako je eksplicitno Ricat -> ostavi
+    - Ako nema firme -> koristi last_company ili Ricat (default)
+    Vraća: (normalized_question, current_company)
+    """
+    q = (user_question or "").strip()
+
+    if not q:
+        return "Koje usluge nudi Ricat?", "Ricat"
+
+    # Alutech -> Ricat (s varijantama)
+    if re.search(r'\b[Aa][Ll][Uu][ -]?[Tt][Ee][Cc][Hh]\b', q):
+        q = re.sub(r'\b[Aa][Ll][Uu][ -]?[Tt][Ee][Cc][Hh]\b', 'Ricat', q)
+        return q, "Ricat"
+
+    # Ricat eksplicitno
+    if re.search(r'\b[Rr][Ii][Cc][Aa][Tt]\b', q):
+        return q, "Ricat"
+
+    # Bez firme → koristi last_company ili default Ricat
+    company = last_company or "Ricat"
+    q = f"{q} (pitanje se odnosi na {company})"
+    return q, company
+
 
 def hr_quality_score(s: str) -> float:
     """Lightweight heuristic for HR-ness and fluency."""
