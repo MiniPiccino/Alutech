@@ -316,7 +316,7 @@ def _split_sentences(text: str) -> List[str]:
     parts = re.split(r"(?<=[\.\!\?\;])\s+|\n{2,}", text)
     return [p.strip() for p in parts if p and p.strip()]
 
-def chunk_text_smart(text: str, size: int = 1000, overlap: int = 200) -> List[str]:
+def chunk_text_smart(text: str, size: int = 500, overlap: int = 150) -> List[str]:
     if not text or not text.strip():
         return []
     sents = _split_sentences(text)
@@ -337,7 +337,7 @@ def chunk_text_smart(text: str, size: int = 1000, overlap: int = 200) -> List[st
         chunks.append(cur)
     return [c.strip() for c in chunks if c.strip()]
 
-def make_chunks_from_pages(pages: List[dict], size: int = 1000, overlap: int = 200) -> List[dict]:
+def make_chunks_from_pages(pages: List[dict], size: int = 500, overlap: int = 150) -> List[dict]:
     out = []
     for rec in pages:
         page = rec["page"]
