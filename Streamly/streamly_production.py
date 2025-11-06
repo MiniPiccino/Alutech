@@ -708,6 +708,11 @@ def build_prompt_with_budget(user_question: str,
         "DeepSeek R1 (cloud)": 16384,
     }
     max_ctx = ctx_windows.get(model_choice, 8192)
+    normalized_question = user_question
+    # zamijeni sve oblike "alutech" s "ricat"
+    normalized_question = normalized_question.replace("Alutech", "Ricat")
+    normalized_question = normalized_question.replace("ALUTECH", "RICAT")
+    normalized_question = normalized_question.replace("alutech", "ricat")
 
     header = (
         "Tvoj zadatak je odgovoriti na korisničko pitanje koristeći ISKLJUČIVO informacije iz sljedećeg konteksta.\n\n"
@@ -726,7 +731,7 @@ def build_prompt_with_budget(user_question: str,
         "- Izbjegavaj meta-komentare i oznake poput <think>.\n\n"
         "📚 KONTEKST:\n"
     )
-    footer = f"\n\n❓ PITANJE KORISNIKA:\n{user_question}\n\n💬 ODGOVOR:\n"
+    footer = f"\n\n❓ PITANJE KORISNIKA:\n{normalized_question}\n\n💬 ODGOVOR:\n"
 
     header_tokens = estimate_tokens(header)
     footer_tokens = estimate_tokens(footer)
