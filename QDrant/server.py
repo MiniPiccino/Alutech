@@ -19,7 +19,7 @@ def read_pdf(path: str) -> str:
     r = PyPDF2.PdfReader(path)
     return "".join(page.extract_text() or "" for page in r.pages)
 
-def chunk(text: str, size=1000, overlap=200) -> List[str]:
+def chunk(text: str, size=500, overlap=150) -> List[str]:
     out, i = [], 0
     while i < len(text):
         out.append(text[i:i+size])
