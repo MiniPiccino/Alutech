@@ -352,7 +352,7 @@ def main():
     user_msg = st.chat_input("Pitaj chat bilo što o učitanim dokumentima (na hrvatskom ili engleskom)...")
     if user_msg:
         user_lang_guess = safe_detect(user_msg)
-        contexts = get_context_smart(user_msg, top_k=10, min_vec_score=0.25)
+        contexts = get_context_smart(user_msg, top_k=10, min_vec_score=0.15)
         if not contexts:
             reply = compose_noinfo_reply(user_msg)
         else:
@@ -442,12 +442,16 @@ def _split_sentences(text: str) -> List[str]:
     parts = re.split(r"(?<=[\.\!\?\;])\s+|\n{2,}", text)
     return [p.strip() for p in parts if p and p.strip()]
 
-def chunk_text_smart(text: str, size: int = 500, overlap: int = 150) -> List[str]:
+def chunk_text_smart(text: str, size: int = 1200, overlap: int = 300) -> List[str]:
+    """
+    Pametno dijeljenje teksta u veće chunkove.
+    Povećani size i overlap da se zadrži cijeli opis tvrtke u istom vektoru.
+    """
     if not text or not text.strip():
         return []
     sents = _split_sentences(text)
     chunks, cur = [], ""
-    target = max(200, size)
+    target = max(400, size)
     for s in sents:
         if len(cur) + len(s) + 1 <= target:
             cur = (cur + " " + s).strip() if cur else s
@@ -463,15 +467,20 @@ def chunk_text_smart(text: str, size: int = 500, overlap: int = 150) -> List[str
         chunks.append(cur)
     return [c.strip() for c in chunks if c.strip()]
 
-def make_chunks_from_pages(pages: List[dict], size: int = 500, overlap: int = 150) -> List[dict]:
+
+def make_chunks_from_pages(pages: List[dict], size: int = 1200, overlap: int = 300) -> List[dict]:
     out = []
     for rec in pages:
         page = rec["page"]
-        txt = rec.get("text","") or ""
+        txt = rec.get("text", "") or ""
+        # --- FIX: eksplicitni kontekst firme ---
+        txt = re.sub(r"(?m)^(\d+\.\s*)([A-ZČĆŽŠĐ].+)$", r"Tvrtka: \2\nOpis:", txt)
+        txt = re.sub(r"(?m)^###\s*([A-ZČĆŽŠĐ].+)$", r"Tvrtka: \1\nOpis:", txt)
         page_chunks = chunk_text_smart(txt, size=size, overlap=overlap)
         for i, c in enumerate(page_chunks):
             out.append({"text": c, "page": page, "chunk_idx_on_page": i})
     return out
+
 
 def reset_collection() -> str:
     client, coll, _ = _qdrant()
@@ -762,6 +771,11 @@ def get_context_smart(query: str, top_k: int = 10, min_vec_score: float = 0.25) 
         return _default_to_company_contexts(query, _prioritize_company_contexts(query, kw_ranked), top_k)
 
     fallback = _default_to_company_contexts(query, [], top_k)
+    if not vec_merged:
+        alt_query = f"tvrtka {query}"
+        alt_vec = get_qdrant_context_vector(alt_query, top_k=top_k)
+        if alt_vec:
+            return alt_vec
     return fallback if fallback else []
 
 # -----------------------------
