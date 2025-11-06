@@ -708,19 +708,26 @@ def build_prompt_with_budget(user_question: str,
         "DeepSeek R1 (cloud)": 16384,
     }
     max_ctx = ctx_windows.get(model_choice, 8192)
-    normalized_question = user_question
-    # zamijeni sve oblike "alutech" s "ricat"
-    normalized_question = normalized_question.replace("Alutech", "Ricat")
-    normalized_question = normalized_question.replace("ALUTECH", "RICAT")
-    normalized_question = normalized_question.replace("alutech", "ricat")
 
+    # --- NORMALIZACIJA UPITA ---
+    normalized_question = user_question.strip()
+    if not normalized_question:
+        normalized_question = "Koje usluge nudi Ricat?"
+    else:
+        # zamijeni sve oblike "alutech" s "ricat"
+        normalized_question = re.sub(r'\b[Aa][Ll][Uu][ -]?[Tt][Ee][Cc][Hh]\b', 'Ricat', normalized_question)
+        # ako se ne spominje nijedna firma, pretpostavi Ricat
+        if not re.search(r'\b[Rr][Ii][Cc][Aa][Tt]\b', normalized_question):
+            normalized_question = f"{normalized_question} (pitanje se odnosi na Ricat)"
+
+    # --- HEADER + FOOTER ---
     header = (
         "Tvoj zadatak je odgovoriti na korisničko pitanje koristeći ISKLJUČIVO informacije iz sljedećeg konteksta.\n\n"
         "🎯 CILJ:\n"
         "Daj jasan, sažet i točan odgovor koji pokriva bit pitanja tako da korisnik odmah dobije najveću moguću vrijednost.\n\n"
         "📜 PRAVILA:\n"
         "- Koristi isključivo informacije iz danog konteksta (nema izmišljanja).\n"
-        "- Poduzeća RICAT i ALUTECH (uključujući sve varijante zapisa poput 'Alutech', 'alutech', 'ALutech' itd.) smatraju se istim poduzećem. "
+        "- Poduzeća RICAT i ALUTECH (uključujući sve varijante zapisa poput 'Alutech', 'alutech', 'ALutech' itd.) smatraju se istim poduzećem.\n"
         "- Ako korisnik spomene Alutech u bilo kojem obliku, tretiraj to kao da se radi o RICAT-u i koristi sve informacije koje se odnose na Ricat.\n"
         "- Ako korisnik ne navede poduzeće o kojem se radi, odgovori kao da se radi o RICAT poduzeću.\n"
         "- Ako kontekst ne sadrži odgovor, reci ovo što je u zagradi (\"Nema dovoljno informacija u dostupnim dokumentima. Provjerite na https://alutech.hr/\").\n"
@@ -733,12 +740,14 @@ def build_prompt_with_budget(user_question: str,
     )
     footer = f"\n\n❓ PITANJE KORISNIKA:\n{normalized_question}\n\n💬 ODGOVOR:\n"
 
+    # --- TOKEN BUDŽET ---
     header_tokens = estimate_tokens(header)
     footer_tokens = estimate_tokens(footer)
     budget = max_ctx - reply_tokens - header_tokens - footer_tokens
     if budget < 256:
         budget = 256
 
+    # --- KONTEKST ---
     context_blob = []
     used = 0
     for score, text in contexts:
@@ -760,6 +769,7 @@ def build_prompt_with_budget(user_question: str,
     context_text = "".join(context_blob) if context_blob else "<nema dostupnog konteksta>"
     prompt = f"{header}{context_text}{footer}"
     return prompt
+
 
 # -----------------------------
 # "No info" reply composer
